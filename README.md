@@ -7,10 +7,10 @@ EffectCraft 版「工具箱大师」面板：原版 AE ScriptUI 脚本 + 兼容�
 ## 下载与安装
 
 - 最新版本：[GitHub Releases](https://github.com/KOGGUA-EDIT/gongjuxiangdashi/releases/latest)
-- 下载 工具箱大师-EC移植.jsx，复制到 `%APPDATA%\EffectCraft\Scripts\ScriptUI Panels\`
+- 下载 `工具箱大师-EC移植.jsx`，复制到 `%APPDATA%\EffectCraft\Scripts\ScriptUI Panels\`
 - 打开 EffectCraft → 菜单「窗口」→「工具箱大师」（面板需关掉重开才会加载新版本）
 
-源码、构建说明与更新记录见 [c-port 分支](https://github.com/KOGGUA-EDIT/gongjuxiangdashi/tree/ec-port)。
+源码、构建说明与更新记录见 [ec-port 分支](https://github.com/KOGGUA-EDIT/gongjuxiangdashi/tree/ec-port)。
 
 ## 特性
 
