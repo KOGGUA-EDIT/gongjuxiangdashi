@@ -125,6 +125,28 @@ function __ecCallSystem(cmd) {
   throw new Error("EffectCraft 版不支持该外部命令：" + s);
 }
 
+// EC 里脚本不能启动外部进程，也没有 shell.open；打开链接一律退化为提示地址。
+function __ecOpenUrl(url) {
+  var u = String(url == null ? "" : url).replace(/^\s+|\s+$/g, "");
+  if (!u) return false;
+  try {
+    if (typeof app !== "undefined" && app && typeof app.openURL === "function") {
+      app.openURL(u);
+      return true;
+    }
+  } catch (e0) {}
+  try {
+    if (typeof __ecShowNote === "function") {
+      __ecShowNote("打开链接", u + "\n\nEffectCraft 不允许脚本直接启动浏览器，请复制上面的地址到浏览器访问。");
+      return false;
+    }
+  } catch (e1) {}
+  try {
+    alert("请手动打开：\n" + u);
+  } catch (e2) {}
+  return false;
+}
+
 try {
   system.callSystem = function (c) { return __ecCallSystem(c); };
 } catch (e) {}
@@ -361,7 +383,9 @@ function __ecTextWidth(s) {
 // 不同控件的文字左右要留的余量：下拉框要留箭头、复选框/单选钮要留方框/圆点。
 function __ecTextPad(kind) {
   if (kind === "dropdownlist") return 52;
-  if (kind === "checkbox" || kind === "radiobutton") return 64;
+  // 勾选框：EC 自身按 text*7+24 算宽度，64 会把「A/P/S/R/T」这种单字母框撑得很宽，
+  // 把整个功能区和工作区都顶大；这里收到 26（仅留出勾选方框空间）。
+  if (kind === "checkbox" || kind === "radiobutton") return 26;
   return 24;
 }
 
@@ -415,6 +439,9 @@ function __ecPolishLayout(root) {
     }
     if (curW > 0 && curW < need) {
       try {
+        if (node.__ecPolishSaved === undefined) {
+          node.__ecPolishSaved = ps ? [Number(ps[0]), Number(ps[1])] : null;
+        }
         node.preferredSize = [Math.ceil(need), __ecTextHeight(kind, curH)];
         changed += 1;
       } catch (e) {}
@@ -463,9 +490,35 @@ function __ecPolishPass(root) {
     var curH = b ? Number(b[3]) : 0;
     if (!curW || curW >= need) continue;
     try {
+      if (node.__ecPolishSaved === undefined) {
+        var psv = null;
+        try { psv = node.preferredSize; } catch (eP) {}
+        node.__ecPolishSaved = psv ? [Number(psv[0]), Number(psv[1])] : null;
+      }
       node.preferredSize = [Math.ceil(need), __ecTextHeight(kind, curH)];
       changed += 1;
     } catch (e) {}
+  }
+  return changed;
+}
+
+function __ecPolishReset(root) {
+  if (!root) return 0;
+  var changed = 0;
+  var stack = [root];
+  var guard = 0;
+  while (stack.length && guard++ < 6000) {
+    var node = stack.pop();
+    var kids = null;
+    try { kids = node.children; } catch (e) {}
+    if (kids) {
+      for (var i = 0; i < kids.length; i++) stack.push(kids[i]);
+    }
+    if (node.__ecPolishSaved !== undefined) {
+      try { node.preferredSize = node.__ecPolishSaved || [-1, -1]; } catch (e2) {}
+      try { delete node.__ecPolishSaved; } catch (e3) { node.__ecPolishSaved = undefined; }
+      changed += 1;
+    }
   }
   return changed;
 }
@@ -490,6 +543,18 @@ function __ecPolishLater(root) {
 // 左侧导航行（listbox + contentWrapper）里，contentWrapper 只拿到自己的
 // preferredSize 宽度，右边空出一大截，导致内容列里的三列按钮各只有 60px、中文被迫折行。
 // 这里按父行实际宽度把 contentWrapper 撑开。
+// m00005 起导航换成 ec-scriptbar.js 里自绘的 group 列（name "ecNavColumn"），
+// 这里两种形态都认。
+function __ecIsNavColumn(c) {
+  try {
+    if (!c) return false;
+    var kind = String(c.type).toLowerCase();
+    if (kind !== "group" && kind !== "panel") return false;
+    return String(c.name || "") === "ecNavColumn";
+  } catch (e) {}
+  return false;
+}
+
 function __ecFitContentWide(root) {
   if (!root) return 0;
   var changed = 0;
@@ -512,19 +577,29 @@ function __ecFitContentWide(root) {
       ta = String(a.type).toLowerCase();
       tb = String(b.type).toLowerCase();
     } catch (e) {}
-    if (ta !== "listbox" && tb !== "listbox") continue;
+    var aNav = (ta === "listbox") || __ecIsNavColumn(a);
+    var bNav = (tb === "listbox") || __ecIsNavColumn(b);
+    if (!aNav && !bNav) continue;
+    var navControl = aNav ? a : b;
+    var wrapper = aNav ? b : a;
     var navW = 0;
     var nb = null;
     try {
       nb = node.bounds;
     } catch (e) {}
     try {
-      navW = ta === "listbox" ? Number(a.bounds[2]) : Number(b.bounds[2]);
+      navW = Number(navControl.bounds[2]);
     } catch (e) {}
+    if (!navW) {
+      try {
+        var nps = navControl.preferredSize;
+        if (nps && Number(nps[0]) > 0) navW = Number(nps[0]);
+      } catch (e2) {}
+    }
+    if (!navW) navW = 110;
     var rowW = nb ? Number(nb[2]) : 0;
-    if (!rowW || !navW) continue;
+    if (!rowW) continue;
     var target = Math.floor(rowW - navW - 12);
-    var wrapper = ta === "listbox" ? b : a;
     var curW = 0;
     var cb = null;
     try {
@@ -539,6 +614,80 @@ function __ecFitContentWide(root) {
     }
   }
   return changed;
+}
+
+// 设置窗口整容：内容左对齐，功能块之间画一条细灰线（EC 没有 separator 控件）。
+// 只在「设置窗口」上生效（用独有文案识别），不影响免责声明等其它弹窗。
+function __ecStyleSettingsWindow(win) {
+  try {
+    if (!win) return 0;
+    var probe = null;
+    var stack = [win];
+    var guard = 0;
+    while (stack.length && guard++ < 2000 && !probe) {
+      var n = stack.pop();
+      var t = "";
+      try { t = n.text; } catch (e) {}
+      if (t === "[属性功能]添加关键帧相隔") { probe = n; break; }
+      var kids = null;
+      try { kids = n.children; } catch (e) {}
+      if (kids) for (var i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+    }
+    if (!probe) return 0;
+    var root = null;
+    try { root = win.children[0]; } catch (e) {}
+    if (!root) return 0;
+    // 设置窗中英文共用同一套「整理后」布局：左对齐、行距 6、半长暗灰分隔线、
+    // 常用脚本目录行上下留白。不随语言切换回原版紧凑样式。
+    root.alignChildren = ["left", "top"];
+    root.spacing = 6;
+    var rows = [];
+    try { rows = root.children || []; } catch (e) {}
+    for (var j = 0; j < rows.length; j++) {
+      try {
+        if (String(rows[j].type).toLowerCase() === "group") rows[j].alignChildren = ["left", "center"];
+      } catch (e0) {}
+      // 常用脚本目录这一行和上下分隔线太近，单独加宽上下留白
+      try {
+        var rowKids = rows[j].children || [];
+        for (var rk = 0; rk < rowKids.length; rk++) {
+          if (String(rowKids[rk].text) === "常用脚本目录") {
+            rows[j].margins = [10, 8, 10, 8];
+            break;
+          }
+        }
+      } catch (e0b) {}
+    }
+    if (!root.__ecSettingsStyled) {
+      root.__ecSettingsStyled = true;
+      root.onDraw = function () {
+        var g = this.graphics;
+        var sz = null;
+        try { sz = this.size; } catch (e) {}
+        var w = sz ? Number(sz[0]) : 0;
+        if (!(w > 40)) return;
+        var kids = this.children || [];
+        var pen = g.newPen(g.PenType.SOLID_COLOR, [0.22, 0.22, 0.25, 1], 1);
+        // 线长缩到一半（左对齐内容区起始位置）
+        var lineW = Math.max(30, Math.round((w - 16) * 0.5));
+        // 最后一段与「确定」按钮之间不画线
+        for (var k = 0; k < kids.length - 2; k++) {
+          var ab = null, bb = null;
+          try { ab = kids[k].bounds; bb = kids[k + 1].bounds; } catch (e1) { continue; }
+          if (!ab || !bb) continue;
+          var y = Math.round((Number(ab[3]) + Number(bb[1])) / 2) + 0.5;
+          if (!(y > 1)) continue;
+          g.newPath();
+          g.moveTo(8, y);
+          g.lineTo(8 + lineW, y);
+          g.strokePath(pen, g.currentPath);
+        }
+      };
+    }
+    return 1;
+  } catch (e) {
+    return 0;
+  }
 }
 
 // 容器间距收紧：EC 默认 spacing 10 / margins [15,15,15,15]，原版面板是按 AE 的
@@ -562,6 +711,8 @@ function __ecDensifyLayout(root) {
     } catch (e) {}
     if (kids) {
       for (var i = 0; i < kids.length; i++) stack.push({ n: kids[i], d: depth + 1 });
+      // 自绘导航列 / 脚本栏自己管间距、边距和对齐，别让 densify 改回 3 / 1px
+      if (node.__ecFreeLayout === true) continue;
       try {
         node.spacing = 3;
 
@@ -744,6 +895,1301 @@ function __ecToggleLayerStyle(layer) {
     return false;
   }
 }
+
+// ============================================================
+// 运行时中英切换
+// - 所有脚本控件（面板 + 弹窗）的 text / helpTip / 列表项文本走同一份字典
+// - 英文译文嵌在构建产物里（build.mjs 注入字典 JSON）
+// - 切换语言时保留中文原文（__ecZhText），可以来回切
+// ============================================================
+var __EC_I18N = {
+  "请先设置工具箱大师中转站路径": "Please set the Toolbox Master transfer station path first",
+  "请先打开一个合成": "Please open a composition first",
+  "请先打开一个合成！": "Please open a composition first!",
+  "空": "Empty",
+  "请先选择一个图层！": "Please select a layer first!",
+  " 个": " items",
+  "开始": "Start",
+  "请先选择一个图层": "Please select a layer first",
+  "无损": "Lossless",
+  "复制合成": "Duplicate Composition",
+  "目标文件夹中没有任何文件！": "No files in the target folder!",
+  "取消素材锁定比例并适配合成": "Unlock footage scale and fit to composition",
+  "完成：": "Done:",
+  "补帧": "Frame Interpolation",
+  "词": "Words",
+  "关闭所有属性": "Close All Properties",
+  "请打开合成": "Please open a composition",
+  "请先选中一个图层！": "Please select a layer first!",
+  "图片": "Image",
+  "应用": "Apply",
+  "指示线动画": "Leader Line Animation",
+  "rem 基础配置": "rem Basic configuration",
+  "        echo 成功数量：!DONE! 张": "        echo Success count: !DONE! images",
+  "        echo 输入文件：!INPUT_VIDEO!": "        echo Input file: !INPUT_VIDEO!",
+  "    echo 当前目录没有视频文件": "    echo No video files in the current directory",
+  "    echo 没有提取到 PNG 帧": "    echo No PNG frames were extracted",
+  "    echo 原视频已删除": "    echo Original video deleted",
+  " 执行失败: ": " Execution failed: ",
+  "补 帧": "Frame Interpolation",
+  "创建纯色层": "Create Solid Layer",
+  "导入": "Import",
+  "发现：": "Found:",
+  "工作区": "Workspace",
+  "缓入": "Ease In",
+  "脚本": "Script",
+  "锚点居中": "Center Anchor Point",
+  "锚定狙击目标": "Anchor Sniper Target",
+  "模型:": "Model:",
+  "漂浮穿梭时间": "Floating Shuttle Time",
+  "请打开一个合成！": "Please open a composition!",
+  "请先选择一个要添加拼贴效果的图层，宝宝！": "Please select a layer to add the collage effect to, baby!",
+  "请选择一个图层！": "Please select a layer!",
+  "请选中至少一个图层。": "Please select at least one layer.",
+  "缺少 realcugan-ncnn-vulkan.exe": "Missing realcugan-ncnn-vulkan.exe",
+  "删除所有效果": "Remove All Effects",
+  "时间重映射": "Time Remapping",
+  "水平居中": "Center Horizontally",
+  "完整命令：\\n": "Full command:\\n",
+  "文字血液.aep": "文字血液.aep",
+  "写入失败（见控制台）": "Write failed (see console)",
+  "渲染失败：\\n\\n": "Render failed:\\n\\n",
+  "音频": "Audio",
+  "找不到输出模块：\\n\\n": "Output module not found:\\n\\n",
+  "background_remove.exe 不存在！": "background_remove.exe not found!",
+  "echo          Real-CUGAN 逐张超分": "echo          Real-CUGAN per-image upscale",
+  "echo 窗口将在 1 秒后关闭...": "echo Window will close in 1 second...",
+  "echo 删除临时拆帧 PNG...": "echo Deleting temporary extracted-frame PNGs...",
+  "echo 输入帧数：!TOTAL!": "echo Input frames: !TOTAL!",
+  "Nikovax_文字 脚本": "Nikovax_Text Script",
+  "rem Real-CUGAN 逐张超分": "rem Real-CUGAN per-image upscale",
+  "            echo [警告] 原视频删除失败，仍然保留。": "            echo [Warning] Failed to delete the original video; it is kept.",
+  "        echo [错误] 生成的 AVI 文件为空。": "        echo [Error] The generated AVI file is empty.",
+  "        rem 更新逐张进度": "        rem Update per-image progress",
+  "    解析路径: ": "    Parsing path: ",
+  "    echo [错误] 没有提取到视频帧。": "    echo [Error] No video frames were extracted.",
+  "    echo [错误] 目标帧数计算失败。": "    echo [Error] Failed to compute the target frame count.",
+  "    echo [错误] 无法创建输出目录：": "    echo [Error] Cannot create the output directory:",
+  "    echo [错误] 无法移动生成的 AVI 文件。": "    echo [Error] Cannot move the generated AVI file.",
+  "    echo [错误] 找不到模型目录：": "    echo [Error] Model directory not found:",
+  "    echo [错误] FFmpeg 没有生成 AVI 文件。": "    echo [Error] FFmpeg did not generate an AVI file.",
+  "    echo [失败] 找不到 RIFE 退出状态文件。": "    echo [Failed] RIFE exit status file not found.",
+  "    echo 输出目录（可能包含部分结果）：": "    echo Output directory (may contain partial results):",
+  "    echo 原始 PNG 序列已保留：": "    echo Original PNG sequence kept:",
+  " 错误:": " Error:",
+  " 个\\n失败：": " items\\nFailed:",
+  " 没有命令名": " No command name",
+  "-effect(\"上下旋转\")(1)": "-effect(\"上下旋转\")(1)",
+  " *   __EC_CMD_MAP[id] = ": " *   __EC_CMD_MAP[id] = ",
+  "' 被忽略，因为它不是支持运动模糊的图层。": "' was ignored because it is not a layer that supports motion blur.",
+  "（未能解析出目录）": "(Could not resolve the directory)",
+  "[螺旋式]: 先添加空对象再在素材图层单击按钮添加！": "[Spiral]: Add a null object first, then click the button on the footage layer!",
+  "[GPT改图] 警告：原输出文件删除失败：\\n": "[GPT Edit] Warning: failed to delete the original output file:\\n",
+  "」设置新的显示名称：": "」Set a new display name:",
+  "\\n\\n可能原因：\\n": "\\n\\nPossible causes:\\n",
+  "\\n\\n删除失败（文件夹可能被其他程序占用，请关闭资源管理器、杀毒软件后重试）": "\\n\\nDelete failed (the folder may be in use by another program; close File Explorer and your antivirus, then try again)",
+  "\\n\\n行号：": "\\n\\nLine number:",
+  "\\n导入 AE 失败：\\n": "\\nFailed to import into AE:\\n",
+  "\\n目标文件正在使用，无法覆盖。": "\\nThe target file is in use and cannot be overwritten.",
+  "\\nAE 没有返回导入项目。": "\\nAE did not return an imported project.",
+  "←Y轴": "←Y axis",
+  "❌ 请先选中一个合成！": "❌ Please select a composition first!",
+  "1.单击:正常\\n2.shift+单击:0-100-0-100\\n3.ctrl+单击:100-0-100-0": "1.Click: Normal\\n2.Shift+Click: 0-100-0-100\\n3.Ctrl+Click: 100-0-100-0",
+  "2. 无损\\n\\n": "2. Lossless\\n\\n",
+  "4. 资源管理器或杀毒软件正在占用文件\\n\\n": "4. File Explorer or antivirus is locking the file\\n\\n",
+  "按shift+单击为单帧调整图层": "Shift+Click to adjust the layer for a single frame",
+  "宝贝，请先选中一个合成！": "Baby, please select a composition first!",
+  "本次输出目录已经存在！\\n\\n": "The output directory already exists!\\n\\n",
+  "变换": "Transform",
+  "补帧目录不存在！\\n\\n": "Frame interpolation directory does not exist!\\n\\n",
+  "补帧输出文件夹中没有找到图片序列！\\n\\n": "No image sequence found in the frame interpolation output folder!\\n\\n",
+  "补帧已经开始，等待 补帧中.txt 删除...": "Frame interpolation started; waiting for the in-progress marker file to be deleted...",
+  "不支持摄像机图层": "Camera layers are not supported",
+  "查看某一片段进度": "View the progress of a segment",
+  "拆帧": "Extract Frames",
+  "超分+补帧 完成！": "Upscale + Frame Interpolation complete!",
+  "成功：": "Success:",
+  "创建调整图层": "Create Adjustment Layer",
+  "创建文本图层": "Create Text Layer",
+  "纯色 ": "Solid ",
+  "打包工程:勾选后所有素材替换到新文件夹里": "Collect Project: when checked, all footage is copied to a new folder",
+  "大网格": "Large Grid",
+  "单击:普通\\nShift+单击:JAWS 动画[中文版]\\nCtrl+单击:JAWS 动画[英文版]": "Click: Normal\\nShift+Click: JAWS Animation [Chinese]\\nCtrl+Click: JAWS Animation [English]",
+  "单击：直接执行。\\n按Shift+单击：与下方图层出点一致": "Click: run directly.\\nShift+Click: match the out point of the layer below",
+  "单击执行图片找视频片段.exe \\n 按Shift+单击执行导入视频  \\n 注意:有些不是100%准确！": "Click to run the image-to-video-clip tool \\n Shift+Click to import a video  \\n Note: some results are not 100% accurate!",
+  "当前工程尚未保存，请先保存工程。": "The current project has not been saved yet. Please save it first.",
+  "当前合成没有标记属性 (markerProperty)。": "The current composition has no markerProperty.",
+  "当前选中的图层不是预合成！": "The selected layer is not a pre-composition!",
+  "导入补帧图片序列": "Import Frame Interpolation Image Sequence",
+  "导入超分图片序列失败：\\n\\n": "Failed to import the upscaled image sequence:\\n\\n",
+  "导入素材：": "Import footage:",
+  "等待 补帧中.txt 超时。\\n\\n": "Timed out waiting for the in-progress marker file.\\n\\n",
+  "等待 Real-CUGAN 输出目录超时！\\n\\n": "Timed out waiting for the Real-CUGAN output directory!\\n\\n",
+  "等待运行中.txt超时": "Timed out waiting for the running marker file",
+  "第一次删除失败，1 秒后重试：\\n": "First delete attempt failed; retrying in 1 second:\\n",
+  "点": "Point",
+  "调换层级": "Swap Layer Order",
+  "定格入点": "Freeze In Point",
+  "对切换画面裁剪": "Crop to Switched Shot",
+  "反转选中图层顺序": "Reverse Selected Layer Order",
+  "分解文本": "Split Text",
+  "复制结果: ": "Copy result: ",
+  "高质量": "High Quality",
+  "工具箱大师": "Toolbox Master",
+  "工具箱大师提取人声": "Toolbox Master Vocal Extraction",
+  "工具箱更新器.py": "工具箱更新器.py",
+  "关闭": "Close",
+  "合成": "Composition",
+  "获取合成与图层": "Get Composition and Layers",
+  "记录原始入点": "Record Original In Point",
+  "检测到运行中.txt，等待中...": "Detected the running marker file; waiting...",
+  "检查目录：": "Check directory:",
+  "脚本不存在": "Script not found",
+  "进进＆出出": "In-In & Out-Out",
+  "居中锚点": "Center Anchor Point",
+  "开始执行 deleteVideosInFolder()": "Running deleteVideosInFolder()",
+  "抠图目录中没有找到 MOV 文件：\\n\\n": "No MOV files found in the matting folder:\\n\\n",
+  "粒子(自定义).ffx": "粒子(自定义).ffx",
+  "两个输出模块模板均无法使用。": "Neither output module template can be used.",
+  "路径保存失败！\\n\\n": "Failed to save the path!\\n\\n",
+  "路径无效，无法继续！\\n\\n": "Invalid path; cannot continue!\\n\\n",
+  "没有发现未使用的素材。": "No unused footage found.",
+  "没有选中任何素材": "No footage selected",
+  "没有找到可以恢复结束时间的素材图层": "No footage layer with a restorable out point was found",
+  "蒙版Shake": "Mask Shake",
+  "面": "Face",
+  "模糊开关": "Blur Toggle",
+  "目录：": "Directory:",
+  "您选择的数值无效！请选择范围为 100 到 500 的有效选项。": "The value you selected is invalid! Please choose a valid option from 100 to 500.",
+  "曝光度": "Exposure",
+  "启动抠图程序(视频)": "Start Matting Tool (Video)",
+  "清除输入框内容": "Clear Input Field",
+  "请创建蒙版": "Please create a mask",
+  "请检查 After Effects 输出模块模板": "Please check the After Effects output module template",
+  "请检查输出目录：\\n": "Please check the output directory:\\n",
+  "请确认文件存在：\\n": "Please confirm the file exists:\\n",
+  "请手动启动下面这个工具：": "Please start the following tool manually:",
+  "请先保存 AE 工程，\\n然后再导入抠图 MOV。": "Please save the AE project first,\\nthen import the matting MOV.",
+  "请先保存工程": "Please save the project first",
+  "请先打开一个 After Effects 项目！": "Please open an After Effects project first!",
+  "请先设置工具箱大师中转站路径！\\n\\n": "Please set the Toolbox Master transfer station path first!\\n\\n",
+  "请先选择一个合成!": "Please select a composition first!",
+  "请先选择至少一个图层。": "Please select at least one layer first.",
+  "请先选中至少一个图层！": "Please select at least one layer first!",
+  "请选择超分倍率和降噪等级！": "Please select the upscale factor and denoise level!",
+  "请选择合成": "Please select a composition",
+  "请选择至少一个图层": "Please select at least one layer",
+  "请在该图层创建蒙版！": "Please create a mask on that layer!",
+  "请只选中一个预合成图层！": "Please select only one pre-composition layer!",
+  "去字幕功能": "Remove Subtitles",
+  "人物背光(先抠图)": "Character Backlight (matte first)",
+  "删除 done.txt 失败：": "Failed to delete done.txt:",
+  "删除关键帧并重置属性": "Delete Keyframes and Reset Properties",
+  "删除蒙版失败：\\n": "Failed to delete the mask:\\n",
+  "删除图层效果": "Remove Layer Effects",
+  "删除效果": "Remove Effect",
+  "删除最后小尾帧失败：": "Failed to delete the last tail frame:",
+  "上下旋转": "Up-Down Rotation",
+  "设置蒙版颜色为蓝色": "Set Mask Color to Blue",
+  "生成 SHAKE": "Generate SHAKE",
+  "失败：": "Failed:",
+  "视频下载": "Video Download",
+  "是否运动模糊": "Motion Blur",
+  "输出目录：\\n": "Output directory:\\n",
+  "说明：运行结束后原面板可能仍在等待输出文件；": "Note: after the run finishes, the original panel may still be waiting for the output file;",
+  "所选图层下方没有其他图层。": "There are no other layers below the selected layer.",
+  "提升画质目录不存在！\\n\\n": "The upscale directory does not exist!\\n\\n",
+  "替换素材": "Replace Footage",
+  "添加不透明度关键帧": "Add Opacity Keyframe",
+  "添加缩放关键帧": "Add Scale Keyframe",
+  "同步": "Sync",
+  "图层 ": "Layer ",
+  "图片导入 AE 失败：\\n\\n": "Failed to import images into AE:\\n\\n",
+  "退出": "Exit",
+  "网格参考": "Grid Reference",
+  "为图层 ": "for layer ",
+  "未找到 masks_overlay_result.mp4": "masks_overlay_result.mp4 not found",
+  "未找到名称以 output（超分）_ 开头的文件夹！\\n\\n": "No folder whose name starts with the upscale output prefix was found!\\n\\n",
+  "未找到左侧或右侧标记，无法执行操作。": "No left or right marker was found; cannot perform the operation.",
+  "文本图层": "Text Layer",
+  "文件位置": "File Location",
+  "无法创建补帧.bat：\\n\\n": "Cannot create the frame interpolation .bat file:\\n\\n",
+  "无法创建截图文件夹：\\n": "Cannot create the screenshot folder:\\n",
+  "无法打开 API 网站：\\n": "Cannot open the API website:\\n",
+  "无法获取图层原点": "Cannot get the layer origin",
+  "无法确定最新的 output 文件夹！": "Cannot determine the latest output folder!",
+  "无法使用输出模块模板：\\n\\n": "Cannot use the output module template:\\n\\n",
+  "无法自动放入时间线。": "Cannot place it into the timeline automatically.",
+  "无效命令 ID: ": "Invalid command ID: ",
+  "下一页": "Next Page",
+  "先把人物抠出来，复制一份，再应用": "Matte the character first, duplicate it, then apply",
+  "线": "Line",
+  "项目不存在": "Project does not exist",
+  "信息": "Info",
+  "修改 Anchor 后无法获取新原点": "Cannot get the new origin after changing the Anchor",
+  "需要手动启动工具": "The tool must be started manually",
+  "选定图层拆解单帧序列图层": "Split the selected layer into single-frame sequence layers",
+  "选择功能": "Select Function",
+  "选中图层下方没有图层": "No layer below the selected layer",
+  "移动锚点失败：\\n\\n": "Failed to move the anchor point:\\n\\n",
+  "已尝试：\\n": "Tried:\\n",
+  "已启动下载！": "Download started!",
+  "已删除：": "Deleted:",
+  "已移动并改名: ": "Moved and renamed: ",
+  "应用Shake预设并添加标记": "Apply Shake preset and add markers",
+  "预设名:": "Preset name:",
+  "原创作者：@payynuz": "Original author: @payynuz",
+  "原始 app.executeCommand 不可用，无法执行: ": "Native app.executeCommand is unavailable; cannot execute: ",
+  "圆滑": "Smooth",
+  "运行失败：": "Run failed:",
+  "噪波": "Noise",
+  "找不到补帧中的 input_frames！\\n\\n": "input_frames for frame interpolation not found!\\n\\n",
+  "这条命令已记录到：": "This command was recorded to:",
+  "执行出错：\\n\\n": "Execution error:\\n\\n",
+  "只下载音频": "Audio Only",
+  "重命名后找不到 input_frames 文件夹！\\n\\n": "input_frames folder not found after renaming!\\n\\n",
+  "重置": "Reset",
+  "状态文件：\\n": "Status file:\\n",
+  "字体网": "Font Site",
+  "最后一帧大于1MB，保留：": "Last frame is larger than 1MB, kept:",
+  "AE 工程保存目录不存在！\\n\\n": "The AE project save directory does not exist!\\n\\n",
+  "AΙ 抠图": "AI Matting",
+  "croproi脚本\\n1.进入预合成。\\n2.选择目标区域，框选内容。\\n3.返回合成，单击按钮！": "croproi script\\n1. Enter the pre-composition.\\n2. Select the target area and marquee the content.\\n3. Return to the composition and click the button!",
+  "deleteVideoOnly 错误: ": "deleteVideoOnly error: ",
+  "EC版 GitHub 仓库": "EC Edition GitHub Repository",
+  "echo                 PNG 无损 FFV1 AVI 合成": "echo                 PNG lossless FFV1 AVI encode",
+  "echo 补帧倍率：!SHOW_SCALE!x": "echo Frame interpolation factor: !SHOW_SCALE!x",
+  "echo 超分图片已保存在：!OUT!": "echo Upscaled images saved to: !OUT!",
+  "echo 失败处理完成，输入素材已保留。": "echo Failure handling complete; input footage kept.",
+  "echo 输出帧率：30 FPS": "echo Output frame rate: 30 FPS",
+  "echo 原始输入素材不会被主动删除。": "echo The original input footage will not be deleted automatically.",
+  "echo RIFE 退出码：!RIFE_RC!": "echo RIFE exit code: !RIFE_RC!",
+  "EffectCraft 面板脚本无法打开资源管理器。\\n\\n": "The EffectCraft panel script cannot open File Explorer.\\n\\n",
+  "GPT 改图 output 文件夹中没有找到图片。\\n\\n": "No images found in the GPT Edit output folder.\\n\\n",
+  "MOV 抠图导入完成，但有部分文件失败。\\n\\n成功：": "MOV matting import finished, but some files failed.\\n\\nSuccess:",
+  "output（超分）_": "output（超分）_",
+  "parent.effect(\"光圈\")(1)": "parent.effect(\"光圈\")(1)",
+  "playPreview 失败: ": "playPreview failed: ",
+  "Position 修改失败：\\n": "Failed to modify Position:\\n",
+  "Real-CUGAN 输出文件夹不存在！\\n\\n": "The Real-CUGAN output folder does not exist!\\n\\n",
+  "rem 创建本次任务输出目录": "rem Create the output directory for this task",
+  "rem 记录本次任务的实际输出目录，供 JSX 读取": "rem Record the actual output directory of this task for the JSX to read",
+  "rem 全部成功：只保留超分图片序列": "rem All succeeded: keep only the upscaled image sequence",
+  "savePreset 失败: ": "savePreset failed: ",
+  "start \\\"\\\" \\\"%~dp0查找相似图.exe\\\"": "start \\\"\\\" \\\"%~dp0查找相似图.exe\\\"",
+  "system.callSystem 被禁用，File.execute() 也不会真正创建进程。": "system.callSystem is disabled, and File.execute() will not actually create a process either.",
+  "thisComp.layer(\\\"锚定狙击目标\\\")": "thisComp.layer(\\\"锚定狙击目标\\\")",
+  "X轴→": "X axis→",
+  "请选中一个合成": "Select a composition",
+  "请先选择一个合成": "Select a composition first",
+  "请先选中一个合成": "Select a composition first",
+  "预合成": "Pre-compose",
+  "图层 '": "Layer '",
+  "' 不支持运动模糊。": "' does not support motion blur.",
+  "目标文件夹不存在！": "Target folder does not exist!",
+  "取消": "Cancel",
+  "旋转": "Rotation",
+  "滑块控制": "Slider Control",
+  "请先打开一个合成并选中图层": "Open a composition and select a layer first",
+  "确定": "OK",
+  "无损\\n\\n": "Lossless\\n\\n",
+  "不透明度": "Opacity",
+  "工具箱大师补帧": "Toolbox Master Frame Interpolation",
+  "径向模糊": "Radial Blur",
+  "请检查 After Effects 输出模块模板。": "Check the After Effects output module template.",
+  "请先选中至少一个关键帧！": "Select at least one keyframe first!",
+  "位置": "Position",
+  "应用内嵌 FFX 预设": "Apply Embedded FFX Preset",
+  "字": "Char",
+  "                        echo [失败] 输出文件为空：!FRAME_NAME!": "                        echo [FAILED] Output file is empty: !FRAME_NAME!",
+  "        echo 当前图片：!FRAME_NAME!": "        echo Current image: !FRAME_NAME!",
+  "    echo 超分图片数量不匹配，停止清理。": "    echo Upscaled image count mismatch, stopping cleanup.",
+  "    echo 检测到 !VIDEO_COUNT! 个视频。": "    echo Detected !VIDEO_COUNT! video(s).",
+  "    echo 无法创建输出目录": "    echo Cannot create output folder",
+  "    echo FFmpeg 拆帧失败": "    echo FFmpeg frame extraction failed",
+  "_抽帧": "_frames",
+  "补帧_": "interp_",
+  "垂直居中": "Center Vertically",
+  "导入PNG失败：": "Failed to import PNG:",
+  "发现文件：": "Files found:",
+  "合并时间重映射关键帧": "Merge Time Remap Keyframes",
+  "活动摄像机": "Active Camera",
+  "空 1": "Null 1",
+  "锚点狙击：进入目标模式": "Anchor Snipe: Target Mode",
+  "锚定狙击线": "Anchor Snipe Line",
+  "目标文件夹不存在：": "Target folder does not exist:",
+  "普通模糊": "Normal Blur",
+  "请等待......!": "Please wait......!",
+  "请先选中图层": "Select a layer first",
+  "请选择一个有效的预设！": "Select a valid preset!",
+  "去字幕": "Remove Subtitles",
+  "删除成功：": "Deleted:",
+  "删除帧": "Delete Frame",
+  "适合高度": "Fit to Height",
+  "添加常用脚本": "Add Common Scripts",
+  "未选择路径": "No path selected",
+  "无法创建 realcugan_run.bat\\n\\n": "Cannot create realcugan_run.bat\\n\\n",
+  "行": "Line",
+  "血液脚本": "血液脚本",
+  "雨水": "Rain",
+  "执行条件函数": "Run Condition Function",
+  "echo               处理失败": "echo               Processing failed",
+  "echo 拆帧完成：!TOTAL! 帧": "echo Frame extraction complete: !TOTAL! frames",
+  "echo 放大倍数：%SCALE%x": "echo Upscale factor: %SCALE%x",
+  "echo 删除原始视频...": "echo Deleting original video...",
+  "echo 原始视频和临时拆帧 PNG 已保留。": "echo Original video and temporary extracted PNGs kept.",
+  "rem 检测视频": "rem Detect video",
+  "savePreset: 已保存到 ": "savePreset: saved to ",
+  "            echo 检测到最后一帧可能为黑帧，删除 !LAST_FRAME!": "            echo Last frame may be black, deleting !LAST_FRAME!",
+  "        echo [错误] PNG 复制失败：%%F": "        echo [ERROR] Failed to copy PNG: %%F",
+  "        rem 每次只提交一张图片": "        rem Submit one image at a time",
+  "    说明: ": "    Note: ",
+  "    echo [错误] 没有有效帧。": "    echo [ERROR] No valid frames.",
+  "    echo [错误] 无法创建 RIFE 执行器。": "    echo [ERROR] Cannot create RIFE runner.",
+  "    echo [错误] 无法创建输出目录。": "    echo [ERROR] Cannot create output folder.",
+  "    echo [错误] 找不到 ffmpeg.exe": "    echo [ERROR] ffmpeg.exe not found",
+  "    echo [错误] 找不到最终生成的 AVI 文件。": "    echo [ERROR] Generated AVI file not found.",
+  "    echo [错误] PNG 复制数量与原始数量不一致。": "    echo [ERROR] Copied PNG count does not match the original count.",
+  "    echo [失败] RIFE 执行失败，原视频保留。": "    echo [FAILED] RIFE failed; original video kept.",
+  "    echo 输出目录已存在，拒绝覆盖：": "    echo Output folder already exists, refusing to overwrite:",
+  "    echo 原始数量：!PNG_COUNT!": "    echo Original count: !PNG_COUNT!",
+  " 的当前时间线添加了标记": " marker added to its current timeline",
+  " 个未使用的素材。": " unused items.",
+  " 秒": " sec",
+  ", {}) 等引擎命令正常。": ", {}) engine commands work.",
+  "，错误：": ", error:",
+  "' 没有 motionBlur 属性。": "' has no motionBlur property.",
+  "（无法写入数据目录，请手动复制下面的命令）": "(Cannot write to the data folder; copy the command below manually)",
+  "[上下式]: 先添加空对象再在素材图层单击按钮添加！": "[Top-Bottom]: Add a null object first, then click the button on the footage layer!",
+  "[GPT改图失败] ": "[GPT image edit failed] ",
+  "【╋】 阵列闪烁": "【╋】 Array Flicker",
+  "\\n\\n目标文件：\\n": "\\n\\nTarget file:\\n",
+  "\\n\\n删除失败（文件可能被其他程序占用）": "\\n\\nDelete failed (the file may be in use by another program)",
+  "\\n\\n已记录到：\\n": "\\n\\nLogged to:\\n",
+  "\\n复制到 AE 工程目录失败。\\n\\n源文件：\\n": "\\nFailed to copy to the AE project folder.\\n\\nSource file:\\n",
+  "\\n添加到时间线失败：\\n": "\\nFailed to add to the timeline:\\n",
+  "← ⏳ 等比 ⏳ →": "← ⏳ Proportional ⏳ →",
+  "+阵列闪烁.ffx": "+Array Flicker.ffx",
+  "❌ 请先选中一个或多个图层！": "❌ Select one or more layers first!",
+  "1.单击=正常创建\\n2.shift+单击=单帧创建": "1. Click = normal create\\n2. Shift+click = single-frame create",
+  "2. output 文件夹正在被其他程序占用\\n": "2. The output folder is in use by another program\\n",
+  "按词拆分\\n1.单击:拆分为文本图层版本！\\n2.按shift键+单击:拆分为形状图层版本！": "Split by word\\n1. Click: split into text layers!\\n2. Shift+click: split into shape layers!",
+  "半调点阵.ffx": "Halftone Dots.ffx",
+  "宝贝，请先选中一个或多个图层！": "Honey, select one or more layers first!",
+  "本人作者bilibili主页": "Author's Bilibili Homepage",
+  "标裁剪": "Marker Crop",
+  "补帧任务结束，但是执行导入时出错：\\n\\n": "Interpolation finished, but import failed:\\n\\n",
+  "补帧图片序列导入成功": "Interpolated image sequence imported",
+  "补帧中.txt 仍然存在，继续等待...": "补帧中.txt still exists, still waiting...",
+  "菜单命令 ": "Menu command ",
+  "查找": "Find",
+  "常用效果": "Common Effects",
+  "超分输出目录不存在！\\n\\n": "Upscale output folder does not exist!\\n\\n",
+  "抽帧.exe 不存在！": "抽帧.exe not found!",
+  "创建方向模糊": "Create Directional Blur",
+  "创建文件夹失败": "Failed to create folder",
+  "纯色 2": "Solid 2",
+  "打开所在文件夹": "Open Containing Folder",
+  "待运行命令.txt": "待运行命令.txt",
+  "单击：应用 [CC 重复拼贴]\\n按Shift+单击：应用 [动态拼贴]": "Click: apply [CC Repetile]\\nShift+click: apply [Motion Tile]",
+  "单击=运行补帧.bat！": "Click = run 补帧.bat!",
+  "单帧调整层": "Single-Frame Adjustment Layer",
+  "当前工程尚未保存，请先保存工程文件。": "The project has not been saved. Save the project file first.",
+  "当前没有打开 AE 工程！": "No AE project open!",
+  "当前预合成名称": "Current pre-composition name",
+  "导入补帧图片序列失败：": "Failed to import interpolated image sequence:",
+  "导入成功，但没有找到合成：\\n\\n": "Imported, but no composition found:\\n\\n",
+  "导入图片": "Import Image",
+  "等待 补帧中.txt 出现...": "Waiting for 补帧中.txt to appear...",
+  "等待超分输出目录超时，任务终止！\\n\\n": "Timed out waiting for the upscale output folder; task aborted!\\n\\n",
+  "等待运行中.txt超时：": "Timed out waiting for 运行中.txt:",
+  "第一次删除异常：": "First delete failed:",
+  "点击后会删除背景图层\\n鸣谢B站UP主：@CNLonely 提供支持GPU技术\\n注意:有些地方会有瑕疵或不干净": "Clicking deletes the background layer\\nThanks to Bilibili creator @CNLonely for the GPU tech\\nNote: some areas may be flawed or unclean",
+  "叠层": "Stack",
+  "动态拼贴": "Motion Tile",
+  "对使用过程中产生的任何版权或法律责任自行承担": "You are responsible for any copyright or legal liability arising from its use",
+  "方向": "Direction",
+  "分离维度": "Separate Dimensions",
+  "复制命令到文件": "Copy Command to File",
+  "给「": "For 「",
+  "工具箱大师 · 脚本": "Toolbox Master · Script",
+  "工具箱大师中转站路径设置": "Toolbox Master Relay Station Path Settings",
+  "工具箱路径：": "Toolbox path:",
+  "关键帧数量": "Keyframe count",
+  "合成设置": "Composition Settings",
+  "获取Key网站": "Get Key Website",
+  "检测到 补帧中.txt 已删除！": "Detected that 补帧中.txt was deleted!",
+  "检测目录：\\n": "Checking folder:\\n",
+  "将保存到：\\n": "Will be saved to:\\n",
+  "脚本目录不存在": "Script folder does not exist",
+  "禁止用于商业或违法用途": "Commercial or illegal use prohibited",
+  "狙击": "Snipe",
+  "看起来你没有安装插件。你必须先安装插件，Auto Crop 才能正常工作。": "Looks like the plugin isn't installed. Install it first for Auto Crop to work.",
+  "快速模式": "Fast Mode",
+  "粒子灰尘": "Particle Dust",
+  "灵感来源:@payynuz @Xezem": "Inspired by: @payynuz @Xezem",
+  "路径不能为空！\\n\\n": "Path cannot be empty!\\n\\n",
+  "路径预览": "Path Preview",
+  "没有工程": "No project",
+  "没有找到 GPT 改图 output 文件夹：\\n\\n": "GPT image edit output folder not found:\\n\\n",
+  "蒙版": "Mask",
+  "蜜柑计划": "Mikan Project",
+  "名称：": "Name:",
+  "模糊应用": "Apply Blur",
+  "目录不存在，跳过： ": "Folder does not exist, skipping: ",
+  "配置文件：\\n": "Config file:\\n",
+  "其他": "Other",
+  "启动抠图程序(图片)": "Launch Cutout Tool (Image)",
+  "清空输入框": "Clear Input",
+  "请打开一个项目": "Open a project",
+  "请检查 BAT 是否成功运行：\\n": "Check whether the BAT ran successfully:\\n",
+  "请确保当前有一个合成处于活动状态，并且选择了图层。": "Make sure a composition is active and a layer is selected.",
+  "请稍后重新执行。": "Please try again later.",
+  "请手动在浏览器中打开：\\n": "Open this in a browser manually:\\n",
+  "请先保存 AE 工程，再导入 GPT 改图结果。": "Save the AE project before importing GPT edit results.",
+  "请先保存工程文件": "Save the project file first",
+  "请先打开一个合成，并选择需要裁剪的图层。": "Open a composition and select the layer to crop first.",
+  "请先选择 RIFE 模型和补帧倍率！": "Select a RIFE model and interpolation factor first!",
+  "请先选择一个或多个图层。": "Select one or more layers first.",
+  "请先选中需要补帧的图层，再点击补帧按钮！": "Select the layer to interpolate, then click the Interpolate button!",
+  "请先在合成面板拖出目标区域（Region of Interest）": "Drag out the target area (Region of Interest) in the composition panel first",
+  "请选择当前合成。": "Select the current composition.",
+  "请选择一个动画预设 (.ffx)": "Select an animation preset (.ffx)",
+  "请选中一个图层": "Select a layer",
+  "请在浏览器中打开链接": "Open the link in your browser",
+  "请重新设置。": "Please set it again.",
+  "全部": "All",
+  "如（遇）有收费购买": "If (you encounter) a paid purchase",
+  "删除 done.txt 失败：\\n": "Failed to delete done.txt:\\n",
+  "删除黑图: ": "Delete black frames: ",
+  "删除命令": "Delete Command",
+  "删除未使用的素材": "Delete Unused Footage",
+  "删除选定图层所有效果": "Remove All Effects from Selected Layers",
+  "删除最后一帧失败": "Failed to delete the last frame",
+  "上一页": "Previous Page",
+  "设置蒙版颜色为绿色": "Set mask color to green",
+  "生成SHAKE 1": "Generate SHAKE 1",
+  "时间反向关键帧": "Reverse Keyframes in Time",
+  "视频只有音频没画面，点击修复！": "Video has audio only, no picture. Click to fix!",
+  "适合复合": "Fit to Comp",
+  "输入预合成名称": "Enter pre-composition name",
+  "纟田": "Detail",
+  "所有关键帧等比例拉伸对齐图层出入点，\\n相当于按Alt键拖动尾部关键帧等比例拉伸！": "Stretch all keyframes proportionally to align with the layer in/out points,\\nequivalent to Alt-dragging the last keyframe to stretch!",
+  "提升画质源码作者：\\n": "Quality enhancement source author:\\n",
+  "添加": "Add",
+  "添加关键帧": "Add Keyframe",
+  "添加位置关键帧": "Add Position Keyframe",
+  "同步工作区到合成时间": "Sync Work Area to Comp Time",
+  "图层「": "Layer 「",
+  "图片移动失败：\\n\\n": "Failed to move image:\\n\\n",
+  "外部命令": "External Command",
+  "微小动作": "Subtle Motion",
+  "未安装 Auto Crop 插件": "Auto Crop plugin not installed",
+  "未找到 yt-dlp 文件夹": "yt-dlp folder not found",
+  "未找到模板文件：\\n\\n": "Template file not found:\\n\\n",
+  "位置关键帧拉伸到图层出入点": "Stretch Position Keyframes to Layer In/Out Points",
+  "文件夹创建失败！\\n\\n": "Failed to create folder!\\n\\n",
+  "文件已经不存在，视为删除成功：\\n": "File no longer exists; treated as deleted:\\n",
+  "无法创建补帧目录！\\n\\n": "Cannot create interpolation folder!\\n\\n",
+  "无法创建临时 BAT 文件：\\n\\n": "Cannot create temporary BAT file:\\n\\n",
+  "无法定位脚本目录": "Cannot locate the script folder",
+  "无法计算 Position 补偿": "Cannot compute Position offset",
+  "无法删除补帧目录中旧的 input_frames 文件夹": "Cannot delete the old input_frames folder in the interpolation folder",
+  "无法添加效果: ": "Cannot add effect: ",
+  "无法作为项目导入：\\n\\n": "Cannot import as project:\\n\\n",
+  "无效命令描述: ": "Invalid command description: ",
+  "下载": "Download",
+  "显示倍率：": "Display scale:",
+  "线性": "Linear",
+  "项目中没有任何素材！": "No footage in the project!",
+  "形状 2": "Shape 2",
+  "修改失败：\\n\\n": "Failed to modify:\\n\\n",
+  "需要文件夹名称以：\\n": "Folder name must begin with:\\n",
+  "选定图层独显[solo]": "Solo Selected Layers [solo]",
+  "选择路径": "Select Path",
+  "渲染未生成有效文件：\\n": "Render produced no valid file:\\n",
+  "移动失败: ": "Move failed: ",
+  "已创建文件夹：": "Folder created:",
+  "已删除 ": "Deleted ",
+  "已删除合成 ": "Deleted composition ",
+  "乚": "Stroke",
+  "用户需确保处理的视频拥有合法使用权": "Users must ensure they hold lawful rights to the videos they process",
+  "预设文件未找到！": "Preset file not found!",
+  "原创作者:小庄掌门": "Original author: Xiaozhuang Zhangmen",
+  "原始 app.executeCommand 重入过深，已截断: ": "Original app.executeCommand re-entered too deeply, truncated: ",
+  "运动幅度\\n1：小幅度\\n2：大幅度": "Motion range\\n1: Small\\n2: Large",
+  "运行中": "Running",
+  "则是不良商贩的欺诈行为": "it is fraud by a bad merchant",
+  "找到 RealCUGAN 输出文件夹：": "Found RealCUGAN output folder:",
+  "整理素材": "Organize Footage",
+  "执行函数出错: ": "Function error: ",
+  "终生免费提供大家": "Free for everyone, forever",
+  "重命名脚本": "Rename Script",
+  "重置属性": "Reset Properties",
+  "准备执行 moveAndImportMP4Files2()": "Preparing to run moveAndImportMP4Files2()",
+  "自定义命名": "Custom Naming",
+  "最后一帧小于等于1MB，删除：": "Last frame is 1MB or less, deleting:",
+  "AE工程目录：": "AE project folder:",
+  "bat.execute() 返回 false": "bat.execute() returned false",
+  "cropToROI 失败: ": "cropToROI failed: ",
+  "deleteVideosInFolder() 执行完成": "deleteVideosInFolder() completed",
+  "EC版作者：KOGGUA": "EC version author: KOGGUA",
+  "echo [成功] PNG 序列合成完成。": "echo [OK] PNG sequence composited.",
+  "echo 补帧倍率：%SHOW_SCALE%x": "echo Interpolation factor: %SHOW_SCALE%x",
+  "echo 检查最后一帧...": "echo Checking the last frame...",
+  "echo 实际倍率：!SHOW_SCALE!x": "echo Actual factor: !SHOW_SCALE!x",
+  "echo 输入视频：!VIDEO!": "echo Input video: !VIDEO!",
+  "echo 正在拆帧...": "echo Extracting frames...",
+  "effect(\"水平旋转\")(1)": "effect(\"Horizontal Rotation\")(1)",
+  "EffectCraft 面板脚本无法启动浏览器。\\n\\n": "EffectCraft panel script cannot launch a browser.\\n\\n",
+  "GPT 改图导入": "GPT Image Edit Import",
+  "moveAndImportMP4Files2() 执行完成！": "moveAndImportMP4Files2() completed!",
+  "output（超分）_ 文件夹已被删除，任务终止！\\n\\n": "The output（超分）_ folder was deleted; task aborted!\\n\\n",
+  "parent.effect(\"景深\")(1)": "parent.effect(\"Depth of Field\")(1)",
+  "playPreview: 本层已发起过播放，忽略重复调用": "playPreview: playback already started for this layer, ignoring duplicate call",
+  "PowerShell 脚本（.ps1）": "PowerShell script (.ps1)",
+  "RealCUGAN 输出处理完成": "RealCUGAN output processing complete",
+  "rem 创建超分素材目录": "rem Create upscale footage folder",
+  "rem 检查超分结果": "rem Check upscale results",
+  "rem AE 自动传入的参数": "rem Parameters passed automatically by AE",
+  "set \\\"RUN_FILE=%BASE_DIR%补帧中.txt\\\"": "set \\\"RUN_FILE=%BASE_DIR%补帧中.txt\\\"",
+  "start \\\"\\\" \\\"%~dp0图片找视频片段.exe\\\"": "start \\\"\\\" \\\"%~dp0图片找视频片段.exe\\\"",
+  "temp = effect(\"滑块控制\")(\"滑块\");\\n[temp, 100]": "temp = effect(\"Slider Control\")(\"Slider\");\\n[temp, 100]",
+  "title RIFE GPU 补帧工具": "title RIFE GPU Frame Interpolation Tool",
+  "X轴关键帧移动": "X-Axis Keyframe Move",
+  "请至少选择一个图层": "Please select at least one layer",
+  "请先选中一个合成！": "Please select a composition first!",
+  "请选择一个图层": "Please select a layer",
+  "纯色层": "Solid Layer",
+  "帧类型": "Frame Type",
+  "抽帧": "Frame Extraction",
+  "请先打开一个合成。": "Please open a composition first.",
+  "缩放": "Scale",
+  " 个，失败：": " succeeded, failed: ",
+  "解预合成": "Unprecompose",
+  "请先选中一个图层": "Please select a layer first",
+  "删除失败: ": "Delete failed: ",
+  "echo 输出目录：!OUT!": "echo Output folder: !OUT!",
+  "操作失败: ": "Operation failed: ",
+  "工具箱大师去字幕": "ToolBox Master Remove Subtitles",
+  "空 ": "Empty ",
+  "请输入视频网址！": "Please enter a video URL!",
+  "视频": "Video",
+  "无法创建 BAT 文件！": "Unable to create BAT file!",
+  "找不到 Lossless 输出模板": "Lossless output template not found",
+  "echo 目标帧数：!TARGET!": "echo Target frame count: !TARGET!",
+  "                echo [失败] 输出图片不存在：!FRAME_NAME!": "                echo [Failed] Output image does not exist: !FRAME_NAME!",
+  "        echo 放大倍数：%SCALE%x": "        echo Upscale factor: %SCALE%x",
+  "    echo 存在超分失败的图片，停止清理。": "    echo Some images failed to upscale; stopping cleanup.",
+  "    echo 检测到源视频帧率：!FPS! FPS": "    echo Detected source video frame rate: !FPS! FPS",
+  "    echo 无法读取源帧率，使用默认值：%DEFAULT_FPS% FPS": "    echo Unable to read source frame rate, using default: %DEFAULT_FPS% FPS",
+  " 个图层锚点定位到目标点": " layers' anchors moved to the target point",
+  "\\n\\n失败原因：\\n\\n": "\\n\\nFailure reason:\\n\\n",
+  "超\\n分": "Super\\nres",
+  "此合成没有上一级（父合成）": "This composition has no parent composition",
+  "定向模糊": "Directional Blur",
+  "返回原合成": "Back to Original Comp",
+  "缓出": "Ease Out",
+  "获取名称": "Get Name",
+  "空对象": "Null Object",
+  "锚点狙击：取消": "Anchor Sniper: Cancel",
+  "模糊": "Blur",
+  "目录不存在：": "Folder does not exist:",
+  "强度": "Intensity",
+  "请输入预合成名称。": "Please enter a pre-composition name.",
+  "请先选中一个预合成图层！": "Please select a pre-composition layer first!",
+  "请选中当前合成，宝宝！": "Please select the current composition, dear!",
+  "缺少 ffmpeg.exe": "ffmpeg.exe is missing",
+  "删除当前时间指示器关键帧": "Delete Current Time Indicator Keyframes",
+  "摄像机空对象": "Camera Null Object",
+  "适合画面": "Fit to Frame",
+  "添加效果": "Add Effect",
+  "未知": "Unknown",
+  "无法创建输出文件夹：\\n": "Unable to create output folder:\\n",
+  "形状 1": "Shape 1",
+  "已打开上一级合成：": "Opened parent composition:",
+  "雨水镜头": "Rain Shot",
+  "中": "Medium",
+  "echo             开始拆帧": "echo             Starting frame extraction",
+  "echo 超分图片序列：": "echo Upscaled image sequence:",
+  "echo 降噪等级：%NOISE%": "echo Denoise level: %NOISE%",
+  "echo 实际输出：!RESULT_COUNT!": "echo Actual output: !RESULT_COUNT!",
+  "GPT 改图": "GPT Image Edit",
+  "rem 检查环境": "rem Checking environment",
+  "Shake 预设": "Shake Preset",
+  "            echo 已删除输入视频。": "            echo Input video deleted.",
+  "        echo [错误] PNG 合成视频失败。": "        echo [Error] Failed to compose PNG video.",
+  "        rem echo 失败数量：!FAILED_FRAME! 张": "        rem echo Failed count: !FAILED_FRAME! frames",
+  "    echo [错误] 部分 PNG 无法复制，取消合成。": "    echo [Error] Some PNGs could not be copied; composition cancelled.",
+  "    echo [错误] 模型缺少 .bin 文件。": "    echo [Error] Model is missing the .bin file.",
+  "    echo [错误] 无法创建拆帧目录。": "    echo [Error] Unable to create frame extraction folder.",
+  "    echo [错误] 无法进入临时 PNG 文件夹。": "    echo [Error] Unable to enter temp PNG folder.",
+  "    echo [错误] 找不到 input_frames 文件夹。": "    echo [Error] input_frames folder not found.",
+  "    echo [错误] FFmpeg 拆帧失败，原视频保留。": "    echo [Error] FFmpeg frame extraction failed; original video kept.",
+  "    echo [失败] 检测到空 PNG 文件，原视频保留。": "    echo [Failed] Empty PNG file detected; original video kept.",
+  "    echo 复制数量：!PNG_INDEX!": "    echo Copied count: !PNG_INDEX!",
+  "    echo 无法创建补帧输出目录": "    echo Unable to create interpolation output folder",
+  "    echo 支持：MP4、MOV、MKV、AVI、WEBM、M4V、FLV、WMV、MPG、MPEG、TS": "    echo Supported: MP4, MOV, MKV, AVI, WEBM, M4V, FLV, WMV, MPG, MPEG, TS",
+  " 复制": " Copy",
+  " 脚本": " Script",
+  " 添加了标记": " markers added",
+  " *": " *",
+  "，大小：": ", size: ",
+  "（按 EC 引擎编号执行）": "(executed by EC engine number)",
+  "[工具箱大师·脚本栏] ": "[ToolBox Master · Script Bar] ",
+  "[视频抠图错误] ": "[Video Keying Error] ",
+  "[thisComp.layer(\\\"锚定狙击目标\\\")": "[thisComp.layer(\\\"Anchor Sniper Target\\\")",
+  "\\n...(内容过长，已截断)": "\\n...(content too long, truncated)",
+  "\\n\\n请检查 BAT 是否成功运行，以及工程目录是否可写。": "\\n\\nPlease check whether the BAT ran successfully and the project folder is writable.",
+  "\\n\\n位置:": "\\n\\nLocation:",
+  "\\n创建 ImportOptions 失败：\\n": "\\nFailed to create ImportOptions:\\n",
+  "\\n复制完成后找不到目标文件。": "\\nTarget file not found after copying.",
+  "\\n行：": "\\nLine:",
+  "← ⏳ 普通 ⏳ →": "← ⏳ Normal ⏳ →",
+  ">\\\"%RUN_FILE%\\\" echo RIFE补帧处理中": ">\\\"%RUN_FILE%\\\" echo RIFE interpolation in progress",
+  "1,单击:添加预设！\\n2,按Shift+单击:添加预设和标记！": "1, Click: add preset!\\n2, Shift+Click: add preset and marker!",
+  "1.导出视频": "1. Export Video",
+  "2.运行并裁剪": "2. Run and Crop",
+  "按帧拆分图层": "Split Layer by Frame",
+  "半调点阵(m's Halftone)": "Halftone Dots (m's Halftone)",
+  "保存.ffx": "Save .ffx",
+  "本软件脚本作者【b站UP主：小庄掌门】不承担任何损失和责任": "The script author (Bilibili creator: Xiao Zhuang Zhang Men) assumes no liability for any loss or damage",
+  "表达式修改失败：\\n": "Failed to modify expression:\\n",
+  "补帧任务结束。": "Interpolation task finished.",
+  "补帧未启动！\\n\\n": "Interpolation not started!\\n\\n",
+  "补帧状态文件已删除。": "Interpolation status file deleted.",
+  "菜单命令未找到（EC 无等价）: ": "Menu command not found (no EC equivalent): ",
+  "查找视频片段": "Find Video Clip",
+  "场景裁剪": "Scene Crop",
+  "超级摄像机": "Super Camera",
+  "创建 AE 导入选项失败：\\n\\n": "Failed to create AE import options:\\n\\n",
+  "创建径向模糊": "Create Radial Blur",
+  "创建形状图层或文字，粒子纹理应用它": "Create a shape layer or text; the particle texture uses it",
+  "错误\\n": "Error\\n",
+  "打开预合成：": "Open pre-composition:",
+  "单独尺寸": "Separate Dimensions",
+  "单击：应用时间重映射\\n按Shift+单击：正倒放！": "Click: apply time remapping\\nShift+Click: toggle forward/reverse!",
+  "单击为适合宽度\\nshift+单击为适合高度": "Click to fit width\\nShift+Click to fit height",
+  "当前 AE 工程尚未保存，请先保存工程。": "The current AE project has not been saved. Please save it first.",
+  "当前合成单击复制则复制全部预合成包括合成本身\\n在项目选定合成复制则复制该合成": "Clicking copy on a composition copies all its pre-compositions including the composition itself\\nCopying a composition selected in the Project panel copies that composition",
+  "当前没有有效的合成被选中。": "No valid composition is currently selected.",
+  "当Ctrl+S保存出现警告乱码时\\n说明打包文件夹已被删除或其它原因\\n可以重新打包工程即可！": "If saving with Ctrl+S shows a garbled warning,\\nthe packed folder was deleted or something similar;\\njust pack the project again!",
+  "导入补帧图片序列失败！\\n\\n": "Failed to import interpolation image sequence!\\n\\n",
+  "导入改图": "Import Edited Image",
+  "导入音频": "Import Audio",
+  "等待 done.txt 超时，任务未完成！\\n\\n": "Timed out waiting for done.txt; the task did not finish!\\n\\n",
+  "等待目录：\\n": "Waiting for folder:\\n",
+  "低质量": "Low Quality",
+  "第一张图片：": "First image:",
+  "点线粒子": "Dot-Line Particles",
+  "定格": "Freeze Frame",
+  "度": "deg",
+  "发光": "Glow",
+  "方向模糊": "Directional Blur",
+  "幅度": "Amplitude",
+  "复制预合成": "Duplicate Pre-composition",
+  "根据当前合成时间线标记进行裁剪功能": "Crop using markers on the current composition timeline",
+  "工具箱大师 v": "ToolBox Master v",
+  "工具箱大师中转站路径设置成功！\\n\\n": "ToolBox Master transfer station path set successfully!\\n\\n",
+  "勾选时给图层应用速度关键帧": "Apply speed keyframes to the layer when checked",
+  "光圈": "Aperture",
+  "恢复图层入点与 solo": "Restore layer in-point and solo",
+  "击发": "Trigger",
+  "检测到 补帧中.txt，补帧已经开始！": "Detected the interpolation-in-progress file; interpolation has already started!",
+  "检测位置：\\n": "Detection location:\\n",
+  "将音频转换为关键帧": "Convert Audio to Keyframes",
+  "脚本所在文件夹": "Folder containing the script",
+  "景深": "Depth of Field",
+  "开始 MAIN": "Start MAIN",
+  "可执行程序（.exe）": "Executable (.exe)",
+  "宽高": "Width/Height",
+  "粒子元素": "Particle Element",
+  "灵感来源@樱庭月见的蓝莓": "Inspired by @Yingting Yuejian's Blueberry",
+  "路径内容：\\n": "Path contents:\\n",
+  "锚点狙击": "Anchor Sniper",
+  "没有可导入的图片序列。": "No image sequence available to import.",
+  "没有找到 output_Rife 文件夹！\\n\\n": "output_Rife folder not found!\\n\\n",
+  "蒙版裁剪": "Mask Crop",
+  "免责公告": "Disclaimer",
+  "命令 ": "Command ",
+  "模型：": "Model:",
+  "目录不存在: ": "Folder does not exist: ",
+  "批量导出视频": "Batch Export Videos",
+  "启动查找相似图失败：\\n": "Failed to start similar image search:\\n",
+  "启动命令.txt": "StartCommand.txt",
+  "清理完成，但有文件删除失败。\\n\\n": "Cleanup complete, but some files could not be deleted.\\n\\n",
+  "请关闭相关程序后重新执行": "Please close the related program and run again",
+  "请检查 RIFE 是否仍在运行。\\n\\n": "Please check whether RIFE is still running.\\n\\n",
+  "请确保你在一个合成中！": "Please make sure you are in a composition!",
+  "请设置工具箱大师中转站路径": "Please set the ToolBox Master transfer station path",
+  "请输入截图文件名：": "Please enter the screenshot file name:",
+  "请先保存 AE 工程文件": "Please save the AE project file first",
+  "请先保存工程文件。": "Please save the project file first.",
+  "请先打开一个主合成！": "Please open a main composition first!",
+  "请先选择合成！": "Please select a composition first!",
+  "请先选择一个图层！\\n\\nMOV 会放置到选定图层上方，\\n并与选定图层的入点对齐。": "Please select a layer first!\\n\\nThe MOV will be placed above the selected layer\\nand aligned to its in-point.",
+  "请先选中要操作的图层。": "Please select the layer you want to work on first.",
+  "请先在设置里填写可用的脚本目录：\\n": "Please fill in a valid script folder in Settings first:\\n",
+  "请选择工具箱大师中转站文件夹": "Please select the ToolBox Master transfer station folder",
+  "请选择一个文本图层！": "Please select a text layer!",
+  "请选中一个文件素材": "Please select a footage item",
+  "请在项目面板中选中一个或多个合成": "Please select one or more compositions in the Project panel",
+  "取消该图层独显功能": "Turn off solo for this layer",
+  "全自动SHAKE": "Fully Auto SHAKE",
+  "如果启用了关键帧，则添加默认关键帧": "Add default keyframes if keyframing is enabled",
+  "删除：": "Delete:",
+  "删除旧补帧中.txt失败：": "Failed to delete the old interpolation-progress file:",
+  "删除失败：\\n": "Delete failed:\\n",
+  "删除项目里多余素材（用不到的素材）！": "Delete unused footage from the project!",
+  "删除原文件成功: ": "Original file deleted: ",
+  "删除最后一帧失败：": "Failed to delete the last frame:",
+  "设置": "Settings",
+  "摄像机控制": "Camera Control",
+  "生成SHAKE 2": "Generate SHAKE 2",
+  "实际倍率参数：": "Actual scale value:",
+  "是否创建这个文件夹？": "Create this folder?",
+  "输出模块设置失败！\\n\\n": "Failed to set the output module!\\n\\n",
+  "输入预合成名称：": "Enter pre-composition name:",
+  "搜索：": "Search:",
+  "所有关键帧对齐图层出入点": "Align all keyframes to layer in/out points",
+  "提升面质": "Enhance Quality",
+  "添加 Tint 效果": "Add Tint effect",
+  "添加锚点关键帧": "Add anchor point keyframe",
+  "添加效果失败: ": "Failed to add effect: ",
+  "统一": "Uniform",
+  "图层入点对齐": "Align Layer In-Points",
+  "图片已导入，但添加到时间线失败：\\n\\n": "Image imported, but adding it to the timeline failed:\\n\\n",
+  "完成\\n\\n复制素材数量:": "Done\\n\\nFootage copied:",
+  "为所有选中的图层分段创建空对象": "Create segment nulls for all selected layers",
+  "未收录的 AE 命令 ID ": "Unrecognized AE command ID ",
+  "未找到“纯色”文件夹": "No \"Solids\" folder found",
+  "未找到视频文件！": "No video file found!",
+  "位置数量\\n2：3个关键帧\\n3：4个关键帧\\n4：5个关键帧\\n4：5个关键帧\\n5：6个关键帧": "Position count\\n2: 3 keyframes\\n3: 4 keyframes\\n4: 5 keyframes\\n4: 5 keyframes\\n5: 6 keyframes",
+  "文件所在目录": "File location",
+  "无 FFX 文件": "No FFX file",
+  "无法创建补帧输出目录！\\n\\n": "Unable to create interpolation output folder!\\n\\n",
+  "无法创建临时 VBS 文件：\\n\\n": "Unable to create temporary VBS file:\\n\\n",
+  "无法读取目录： ": "Unable to read folder: ",
+  "无法将 output 文件夹重命名为 input_frames！\\n\\n": "Unable to rename output folder to input_frames!\\n\\n",
+  "无法删除文件夹: ": "Unable to delete folder: ",
+  "无法写入运行中.txt": "Unable to write the running-status file",
+  "无效 EC 菜单编号: ": "Invalid EC menu ID: ",
+  "细节拆分": "Detail Split",
+  "先安装 【Furikake】 插件": "Install the [Furikake] plugin first",
+  "显示名称": "Display Name",
+  "线性定格出点": "Linear Freeze Out Point",
+  "小网格": "Small Grid",
+  "形状图层": "Shape Layer",
+  "修剪合成至工作区": "Trim Comp to Work Area",
+  "序列失败:": "Sequence failed:",
+  "选择保存位置": "Choose save location",
+  "选中图层的时间范围无效": "The selected layer's time range is invalid",
+  "摇晃 3": "Shake 3",
+  "移动指示线动画图层失败：\\n\\n": "Failed to move the indicator animation layer:\\n\\n",
+  "已导入超分图片序列：": "Upscaled image sequence imported:",
+  "已删除 done.txt": "Deleted done.txt",
+  "已删除图层 ": "Layer deleted ",
+  "应用动画预设": "Apply Animation Preset",
+  "预合成 ": "Pre-composition ",
+  "预设已保存!": "Preset saved!",
+  "原创作者:payynuz": "Original author: payynuz",
+  "原文件夹：\\n": "Original folder:\\n",
+  "运动模糊按钮切换开关": "Motion blur button toggle",
+  "在合成 ": "In composition ",
+  "找不到 Rife.exe！\\n\\n": "Rife.exe not found!\\n\\n",
+  "找到更新器信息，但文件不存在：\\n\\n": "Updater info found, but the file does not exist:\\n\\n",
+  "整理项目时发生错误：\\n": "An error occurred while organizing the project:\\n",
+  "执行失败：\\n\\n": "Execution failed:\\n\\n",
+  "重建旋转关键帧 + 缓动": "Rebuild rotation keyframes + easing",
+  "重试删除成功：\\n": "Retry delete succeeded:\\n",
+  "转换失败，请手动检查图层": "Conversion failed; please check the layer manually",
+  "准备中...": "Preparing...",
+  "自动裁剪": "Auto Crop",
+  "作者：【小庄掌门】和【叶切MTG】\\n": "Authors: [Xiao Zhuang Zhang Men] and [Ye Qie MTG]\\n",
+  "AE工程迁移": "AE Project Migration",
+  "Comp → Layer 坐标转换失败": "Comp → Layer coordinate conversion failed",
+  "cropToROI: 没有活动合成": "cropToROI: no active composition",
+  "EC 菜单编号 ": "EC menu ID ",
+  "echo                       补帧失败": "echo                       Interpolation failed",
+  "echo 倍率：!SHOW_SCALE!x": "echo Scale: !SHOW_SCALE!x",
+  "echo 补帧任务全部完成。": "echo All interpolation tasks completed.",
+  "echo 模型：!MODEL_NAME!": "echo Model: !MODEL_NAME!",
+  "echo 输出分辨率：1920x1080": "echo Output resolution: 1920x1080",
+  "echo 输入帧数：!FRAME_COUNT!": "echo Input frames: !FRAME_COUNT!",
+  "echo AVI 文件：!GENERATED_VIDEO!": "echo AVI file: !GENERATED_VIDEO!",
+  "effect(\"自转\")(1)": "effect(\"Spin\")(1)",
+  "EffectCraft 面板脚本无法启动外部程序：": "EffectCraft panel script cannot launch external programs:",
+  "hideLayerControls 失败: ": "hideLayerControls failed: ",
+  "MP4 临时合成渲染": "MP4 Temp Comp Render",
+  "output（超分）文件夹不存在！\\n\\n": "output (upscaled) folder does not exist!\\n\\n",
+  "parent.effect(\"景深开关\")(1)": "parent.effect(\"Depth of Field Switch\")(1)",
+  "playPreview: 活动项不是合成，降级为不播放": "playPreview: active item is not a composition; falling back to no playback",
+  "purge 失败: ": "purge failed: ",
+  "RealCUGAN 输出已直接重命名为：": "RealCUGAN output renamed directly to:",
+  "rem 获取源视频帧率": "rem Get source video frame rate",
+  "rem 检查处理结果": "rem Check processing result",
+  "rem FFmpeg 拆帧": "rem FFmpeg frame extraction",
+  "shapesFromText 失败: ": "shapesFromText failed: ",
+  "stopPreview 失败: ": "stopPreview failed: ",
+  "temp = effect(\"滑块控制\")(\"Slider\");\\n[temp, 100]": "temp = effect(\"Slider Control\")(\"Slider\");\\n[temp, 100]",
+  "ToolBoxMasterPath.txt 创建失败！": "Failed to create ToolBoxMasterPath.txt!",
+  "Y轴→": "Y axis →",
+  "撤销组": "Undo Group",
+  "调整图层": "Adjustment Layer",
+  "请先选择一个合成！": "Please select a composition first!",
+  "请先选择一个合成。": "Please select a composition first.",
+  "请先选中图层！": "Please select a layer first!",
+  "工具箱大师抠图": "Toolbox Master Matting",
+  "请先选择图层。": "Please select a layer first.",
+  "无法创建输出文件夹：": "Cannot create output folder: ",
+  "倍": "x",
+  "没有选中任何图层。": "No layers are selected.",
+  "请至少选中一个图层": "Please select at least one layer",
+  "摄像机": "Camera",
+  " 错误: ": " - error: ",
+  "纯色 1": "Solid 1",
+  "工具箱大师提升画质": "Toolbox Master Enhance Quality",
+  "锚点": "Anchor Point",
+  "请先选择图层": "Please select a layer first",
+  "提示": "Notice",
+  "选中的图层不是预合成！": "The selected layer is not a pre-composition!",
+  "执行失败：\\n": "Execution failed: \\n",
+  "echo 输出目录：!OUTPUT_DIR!": "echo Output directory: !OUTPUT_DIR!",
+  "            echo [失败] !FRAME_NAME!": "            echo [FAILED] !FRAME_NAME!",
+  "        echo 降噪等级：%NOISE%": "        echo Denoise level: %NOISE%",
+  "    echo 当前版本一次只能处理一个视频。": "    echo This version can only process one video at a time.",
+  "    echo 警告：原视频删除失败": "    echo Warning: failed to delete the original video",
+  "    echo 原始视频已保留。": "    echo Original video kept.",
+  " 上的所有标记": " - all markers removed",
+  "+ 闪烁": "+ Flicker",
+  "抽\\n帧": "Extract\\nFrames",
+  "大": "Large",
+  "独显": "Solo",
+  "分辨率:": "Resolution:",
+  "缓动": "Ease",
+  "级": "Level",
+  "快速粘贴": "Quick Paste",
+  "锚点狙击：确定": "Anchor Sniper: OK",
+  "模糊半径": "Blur Radius",
+  "批量预合成": "Batch Pre-compose",
+  "清晰度:": "Sharpness:",
+  "请先选择需要修改锚点的图层。": "Please select the layers whose anchor point you want to change.",
+  "请选择一个合成。": "Please select a composition.",
+  "请选中一个图层！": "Please select a layer!",
+  "缺少 models-se 模型目录": "Missing models-se model folder",
+  "删除失败：": "Delete failed: ",
+  "生成旋转关键帧 + 缓动": "Generate rotation keyframes + easing",
+  "适合宽度": "Fit Width",
+  "图片数量：": "Image count: ",
+  "未知错误": "Unknown error",
+  "小": "Small",
+  "选中的图层不是预合成。": "The selected layer is not a pre-composition.",
+  "已将 ": "Moved ",
+  "预合成名称": "Pre-composition name",
+  "逐个处理": "Process one by one",
+  "echo            全部处理完成": "echo            All done",
+  "echo 成功帧数：!DONE!": "echo Successful frames: !DONE!",
+  "echo 模型名称：!MODEL_NAME!": "echo Model name: !MODEL_NAME!",
+  "echo 输入文件：!INPUT_VIDEO!": "echo Input file: !INPUT_VIDEO!",
+  "Nikovax 文字.aep": "Nikovax 文字.aep",
+  "rem 统计输入帧": "rem Count input frames",
+  "title Real-CUGAN 视频超分工具": "title Real-CUGAN Video Super-Resolution Tool",
+  "            echo 最后一帧正常。": "            echo Last frame is OK.",
+  "        echo 输入视频：": "        echo Input video:",
+  "      -> 调用 __EC_CMD_FUNCS[": "-> Calling __EC_CMD_FUNCS[",
+  "    echo [错误] 当前目录没有找到输入视频。": "    echo [ERROR] No input video found in the current folder.",
+  "    echo [错误] 模型缺少 .param 文件。": "    echo [ERROR] Model is missing a .param file.",
+  "    echo [错误] 无法创建临时 PNG 文件夹。": "    echo [ERROR] Cannot create the temporary PNG folder.",
+  "    echo [错误] 无法启动 RIFE。": "    echo [ERROR] Cannot start RIFE.",
+  "    echo [错误] 找不到 rife-ncnn-vulkan.exe": "    echo [ERROR] rife-ncnn-vulkan.exe not found.",
+  "    echo [错误] FFmpeg 合成失败，退出码：!PNG_FFMPEG_RC!": "    echo [ERROR] FFmpeg composition failed, exit code: !PNG_FFMPEG_RC!",
+  "    echo [失败] 输出帧数不足，原视频保留。": "    echo [FAILED] Not enough output frames, original video kept.",
+  "    echo 检测到 PNG 序列：!PNG_COUNT! 张": "    echo PNG sequence detected: !PNG_COUNT! images",
+  "    echo 无法创建超分素材目录": "    echo Cannot create the super-resolution asset folder",
+  "    echo RIFE 日志：": "    echo RIFE log:",
+  " 个 AE ID 已映射）": " AE IDs mapped)",
+  " 没有标记": " no markers",
+  " 字节": " bytes",
+  " * 映射策略：": " * Mapping strategy: ",
+  "...(内容过长，已截断)": "...(Content too long, truncated)",
+  "（未能从命令中解析出路径，见下方完整命令）": "(Could not parse a path from the command; see the full command below)",
+  "[工具箱大师] 图层样式开关不可用：": "[Toolbox Master] Layer style toggle unavailable: ",
+  "[图片抠图错误] ": "[Image matting error] ",
+  "」没有可复制的素材源，无法使用 layers.add(src.source)。": " - no copyable source footage; layers.add(src.source) cannot be used.",
+  "\\n\\n--------------------\\n失败详情：\\n\\n": "\\n\\n--------------------\\nFailure details:\\n\\n",
+  "\\n\\n请前往百度网盘[工具箱大师脚本]→[工具箱大师中转站]→[抠图] 下载替换。": "\\n\\nPlease go to Baidu Netdisk [Toolbox Master Scripts]→[Toolbox Master Relay]→[Matting] to download the replacement.",
+  "\\n\\n文件：\\n": "\\n\\nFile:\\n",
+  "\\n错误信息：\\n": "\\nError message:\\n",
+  "\\n或 ": "\\nor ",
+  "\\nAE 工程目录中的 MOV 不存在。": "\\nThe MOV file does not exist in the AE project folder.",
+  "←X轴": "←X axis",
+  "⚠️ 该图层已存在关键帧\\n请清除或创建空对象后再运行！": "⚠️ This layer already has keyframes\\nPlease clear them or create a null object before running!",
+  "1. input_frames 已存在且无法删除\\n": "1. input_frames already exists and cannot be deleted\\n",
+  "1.选中图层单击在项目板显示！\\n2.选中图层按shift键单击在资源管理器显示！": "1. Click the selected layer to reveal it in the Project panel!\\n2. Shift+click the selected layer to reveal it in Explorer!",
+  "3. RealCUGAN 尚未完全退出\\n": "3. RealCUGAN has not fully exited\\n",
+  "按字拆分\\n1.单击:拆分为文本图层版本！\\n2.按shift键+单击:拆分为形状图层版本！": "Split by Character\\n1. Click: split into text layer versions!\\n2. Shift+click: split into shape layer versions!",
+  "半径": "Radius",
+  "保存动画预设": "Save Animation Preset",
+  "必须填写有效路径并点击“确定”后才能关闭此窗口。": "You must enter a valid path and click OK before closing this window.",
+  "补帧超过 2 小时未完成！\\n\\n": "Frame interpolation has not finished after 2 hours!\\n\\n",
+  "补帧输出目录：": "Frame interpolation output folder: ",
+  "补帧文件夹中没有找到 output_ 文件夹！\\n\\n": "No output_ folder found in the interpolation folder!\\n\\n",
+  "不存在抠图目录：\\n\\n": "Matting folder does not exist:\\n\\n",
+  "参与优化脚本:@CNLonely": "Optimization contributors: @CNLonely",
+  "查找相似图": "Find Similar Images",
+  "超分 + 补帧！启动处理": "Super-resolution + Frame Interpolation! Starting",
+  "超摄像机": "Hyper Camera",
+  "创建导入选项失败：\\n\\n": "Failed to create import options:\\n\\n",
+  "创建空对象": "Create Null Object",
+  "纯色": "Solid",
+  "打包工程": "Collect Project",
+  "打入预合成": "Pre-compose Into",
+  "单击：1个空对象\\nShift+单击：2个空对象\\nCtrl+单击：3个空对象": "Click: 1 null object\\nShift+click: 2 null objects\\nCtrl+click: 3 null objects",
+  "单击:执行锚点跟图层一起居中\\n按Shift+单击:执行纯锚点居中": "Click: center the anchor point together with the layer\\nShift+click: center the anchor point only",
+  "单击执行查找相似图.exe \\n 注意:有些不是100%准确！": "Click to run the similarity search tool \\n Note: some results may not be 100% accurate!",
+  "当前 AE 工程尚未保存！\\n\\n": "The current AE project has not been saved!\\n\\n",
+  "当前合成没有标记。": "The current composition has no markers.",
+  "当前目录：\\n": "Current folder:\\n",
+  "导出失败：\\n": "Export failed:\\n",
+  "导入超分图片序列": "Import Super-resolution Image Sequence",
+  "导入模板失败：\\n\\n": "Failed to import template:\\n\\n",
+  "到浏览器选择喜欢图片，右键复制图片，\\n再单击此按钮即可导入图片\\n注意:只能导入图片格式！\\n不支持GIF等动态图片！": "Pick an image in your browser, right-click and copy it,\\nthen click this button to import it.\\nNote: only image formats are supported!\\nAnimated images such as GIF are not supported!",
+  "等待 done.txt 超时！\\n\\n": "Timed out waiting for done.txt!\\n\\n",
+  "等待输出文件完成写入...": "Waiting for the output file to finish writing...",
+  "第二次删除异常：\\n": "Second deletion attempt failed:\\n",
+  "第一帧：": "First frame: ",
+  "调换": "Swap",
+  "定格出点": "Freeze Out Point",
+  "对齐失败：\\n": "Alignment failed:\\n",
+  "发生错误：\\n": "An error occurred:\\n",
+  "分段": "Segment",
+  "父子级对象": "Parent Object",
+  "感谢大家的理解与支持！": "Thank you for your understanding and support!",
+  "工程素材迁移": "Project Asset Migration",
+  "工具箱大师抽帧": "Toolbox Master Frame Extraction",
+  "工具箱更新器.exe": "工具箱更新器.exe",
+  "挂载 app.executeCommand 失败: ": "Failed to mount app.executeCommand: ",
+  "合并帧": "Merge Frames",
+  "活动相机": "Active Camera",
+  "基础目录不存在！\\n\\n": "Base folder does not exist!\\n\\n",
+  "检测到抠图完成，开始导入PNG...": "Matting complete, starting PNG import...",
+  "检查路径：\\n": "Checking path:\\n",
+  "焦距参考点": "Focus Reference",
+  "脚本运行失败": "Script failed to run",
+  "景深开关": "DOF Toggle",
+  "开始下载": "Start Download",
+  "抠图": "抠图",
+  "来源：": "Source: ",
+  "连线": "Connect",
+  "路径：": "Path: ",
+  "路径设置成功！": "Path set successfully!",
+  "没有打开的项目！": "No project is open!",
+  "没有可分离的形状！": "No shapes available to separate!",
+  "没有找到 Transform": "Transform not found",
+  "蒙版点数太少！": "The mask has too few points!",
+  "免责声明：": "Disclaimer: ",
+  "模板文件：\\n": "Template file:\\n",
+  "目标文件夹中没有 JSX 文件": "No JSX files in the target folder",
+  "您没有选择任何图层": "You have not selected any layers",
+  "平面": "平面",
+  "启动更新器失败：\\n\\n": "Failed to start the updater:\\n\\n",
+  "切换运动模糊": "Toggle Motion Blur",
+  "清理完成！\\n\\n": "Cleanup complete!\\n\\n",
+  "请回到面板重新操作，或按需手动处理输出。": "Please return to the panel and try again, or handle the output manually.",
+  "请检查脚本所在文件夹是否有写入权限：\\n\\n": "Please check whether the script folder has write permission:\\n\\n",
+  "请确保您选择了一个合成，并且选择了图层。": "Please make sure you have selected a composition and a layer.",
+  "请设置有效的工具箱大师中转站文件夹。": "Please set a valid Toolbox Master relay folder.",
+  "请输入迁移文件夹名称": "Enter the migration folder name",
+  "请先保存当前工程！": "Please save the current project first!",
+  "请先保存项目。": "Please save the project first.",
+  "请先激活一个合成。": "Please activate a composition first.",
+  "请先选择图层！": "Please select a layer first!",
+  "请先选择一个文本图层！": "Please select a text layer first!",
+  "请先选中一个图层。": "Please select a layer first.",
+  "请选当前合成": "Please select the current composition",
+  "请选择工具箱大师中转站文件夹。": "Please select the Toolbox Master relay folder.",
+  "请选择一些图层，然后重试": "Please select some layers and try again",
+  "请选中一个预合成！": "Please select a pre-composition!",
+  "请只选择一个图层。": "Please select only one layer.",
+  "取消项目选中失败：": "Failed to deselect project items: ",
+  "缺少本地实现: ": "Missing local implementation: ",
+  "删除": "Delete",
+  "删除: ": "Delete: ",
+  "删除蒙版": "Delete Mask",
+  "删除素材": "Delete Footage",
+  "删除小尾帧后没有剩余图片！\\n\\n": "No images left after removing the trailing frame!\\n\\n",
+  "删除最后小尾帧：": "Removing the last small trailing frame: ",
+  "删除最后一帧小文件：": "Deleting the last small frame file: ",
+  "设置蒙版颜色为红色": "Set the mask color to red",
+  "深度分析": "深度分析",
+  "生成SHAKE 3": "Generate SHAKE 3",
+  "使用超分输出文件夹：": "Using super-resolution output folder: ",
+  "是否启动运动模糊": "Enable motion blur?",
+  "输出目录：": "Output folder: ",
+  "水平旋转": "Horizontal Rotation",
+  "所选片段太长，请缩短其时长（每个动作最多10秒）": "The selected clip is too long; please shorten it (max 10 seconds per action)",
+  "提升画质": "提升画质",
+  "替换失败:": "Replacement failed: ",
+  "添加“指示线动画”失败：\\n\\n": "Failed to add “Guide Line Animation”:\\n\\n",
+  "添加摄像机与空对象": "Add Camera and Null Object",
+  "添加旋转关键帧": "Add Rotation Keyframes",
+  "头尾帧裁剪": "Trim Head and Tail Frames",
+  "图层样式开关": "Layer Style Toggle",
+  "图片已经导入 AE，但当前没有活动合成，": "The images were imported into AE, but there is no active composition, ",
+  "完整命令：": "Full command: ",
+  "为所有选中的图层统一创建空对象": "Create a null object for all selected layers",
+  "未找到 FFX 文件夹": "FFX folder not found",
+  "未找到更新器。\\n请确保同目录存在：\\n": "Updater not found.\\nMake sure it exists in the same folder:\\n",
+  "未找到形状组": "Shape group not found",
+  "文本层": "Text Layer",
+  "文件所在目录：\\n": "File folder:\\n",
+  "无法创建 ToolBoxMasterPath.txt！\\n\\n": "Cannot create ToolBoxMasterPath.txt!\\n\\n",
+  "无法创建补帧文件夹！\\n\\n": "Cannot create the interpolation folder!\\n\\n",
+  "无法创建文件夹：": "Cannot create folder: ",
+  "无法获取工具箱大师中转站路径：\\n": "Cannot get the Toolbox Master relay path:\\n",
+  "无法启动补帧.bat！": "Cannot start the frame interpolation batch file!",
+  "无法使用输出模块：\\n\\n": "Cannot use output module:\\n\\n",
+  "无法验证 ToolBoxMasterPath.txt！": "Cannot validate ToolBoxMasterPath.txt!",
+  "无效的 output（超分）文件夹！": "Invalid output (super-resolution) folder!",
+  "下方没有可用的参考图层": "No usable reference layers below",
+  "先安装 【Plexus】 插件": "Please install the [Plexus] plugin first",
+  "显示网格": "Show Grid",
+  "线性定格入点": "Linear Freeze In Point",
+  "效果": "Effect",
+  "修复下载视频_": "Repair downloaded video_",
+  "需要手动启动 ": "Requires manual start",
+  "旋转数量\\n2：3个关键帧\\n3：4个关键帧": "Rotation Count\\n2: 3 keyframes\\n3: 4 keyframes",
+  "选择的路径不存在：\\n\\n": "The selected path does not exist:\\n\\n",
+  "选中图层的视频开关(眼睛)是关闭状态，无法设置Solo！": "The video switch (eye) of the selected layer is off, so Solo cannot be set!",
+  "一键整理": "One-click Organize",
+  "移动资源并生成bat": "Move assets and generate bat",
+  "已挂载 app.executeCommand（": "Mounted app.executeCommand (",
+  "已删除 done.txt：\\n": "Deleted done.txt:\\n",
+  "已写入 启动命令.txt": "Wrote the launch command file",
+  "应用Shake预设": "Apply Shake Preset",
+  "预合成匹配当前合成并保持画面": "Pre-compose to match the current composition and keep the image",
+  "预设已保存!\\n": "Preset saved!\\n",
+  "原创作者：Xezem": "Original author: Xezem",
+  "原文件删除失败（可能被占用）: ": "Failed to delete the original file (it may be in use): ",
+  "运行": "Run",
+  "在剪贴板中找不到图片。\\n请尝试再次复制（Ctrl+C）。": "No image found in the clipboard.\\nPlease try copying it again (Ctrl+C).",
+  "找不到补帧工具目录！\\n\\n": "Frame interpolation tool folder not found!\\n\\n",
+  "找到最新补帧输出文件夹：": "Found the latest interpolation output folder: ",
+  "整体居中": "Center Overall",
+  "只能选择一个图层进行解预合成操作！\\n要想多个操作请勾选批量解预合成复选框！": "You can only un-precompose one layer at a time!\\nTo process several, check the Batch Un-precompose checkbox!",
+  "重命名": "Rename",
+  "重新设置所有属性": "Reset all properties",
+  "状态文件：": "Status file: ",
+  "字符串命令无法执行: ": "Cannot execute string command: ",
+  "自转": "Spin",
+  "作者：小庄掌门": "Author: Xiaozhuang Zhangmen",
+  "app.executeCommand 不是函数，无法挂载": "app.executeCommand is not a function; cannot mount",
+  "createRunFile 错误：": "createRunFile error: ",
+  "Cut.exe 不存在！": "Cut.exe does not exist!",
+  "EC 命令表不可用，无法执行菜单编号: ": "EC command table unavailable; cannot run menu ID: ",
+  "echo                     RIFE 补帧成功": "echo                    RIFE interpolation succeeded",
+  "echo 编码格式：FFV1 无损": "echo Encoding: FFV1 lossless",
+  "echo 超分图片已保存在：": "echo Super-resolution images saved to: ",
+  "echo 模型名称：%MODEL_NAME%": "echo Model name: %MODEL_NAME%",
+  "echo 输出路径：%OUTPUT_ROOT%": "echo Output path: %OUTPUT_ROOT%",
+  "echo 所有视频转换完成，旧视频已删除！\\r\\n": "echo All videos converted, old videos deleted!\\r\\n",
+  "echo PNG 数量：!PNG_COUNT!": "echo PNG count: !PNG_COUNT!",
+  "EffectCraft 里脚本不能替你打开资源管理器，请手动打开：\\n": "EffectCraft cannot open Explorer for you; please open it manually:\\n",
+  "exe.execute() 返回 false": "exe.execute() returned false",
+  "MAIN 出错，当前步骤：": "MAIN error, current step: ",
+  "MP4 输出失败：\\n\\n": "MP4 export failed:\\n\\n",
+  "output（超分）文件夹中没有找到图片！\\n\\n": "No images found in the output (super-resolution) folder!\\n\\n",
+  "parent.effect(\"缩放\")(1)": "parent.effect(\"Scale\")(1)",
+  "PNG导入完成": "PNG import complete",
+  "r = parent.effect(\"半径\")(1);[0,0,-r]": "r = parent.effect(\"Radius\")(1);[0,0,-r]",
+  "rem 拆帧": "rem Split frames",
+  "rem 获取帧率": "rem Get frame rate",
+  "rem 全部成功": "rem All succeeded",
+  "revealKeyframes 失败: ": "revealKeyframes failed: ",
+  "shapesFromText: 没有活动合成": "shapesFromText: no active composition",
+  "stopPreview: 本层没有发起过播放，安全 no-op": "stopPreview: this layer never started playback, safe no-op",
+  "thisComp.layer(\"摄像机控制\").effect(\"显示网格\")(1)*100": "thisComp.layer(\"Camera Control\").effect(\"Show Grid\")(1)*100",
+  "VBScript 脚本（.vbs）": "VBScript script (.vbs)",
+  "Y轴关键帧移动": "Y-axis keyframe movement",
+  "锚点工具": "Anchor Tool",
+  "常用工具": "Common Tools",
+  "合成工具": "Compositing Tools",
+  "脚本信息": "Script Info",
+  "设置窗口": "Settings",
+  "图层裁剪[删除后半段]是否+1帧": "Crop layers [delete second half] +1 frame?",
+  "是/否": "Yes/No",
+  "[属性功能]添加关键帧相隔": "[Properties] Keyframe interval",
+  "帧": "frames",
+  "默认": "Default",
+  "检测更新": "Check for updates",
+  "界面语言": "Language",
+  "常用脚本目录": "Script folder",
+  "当前版本：": "Current version: ",
+  "常用脚本：点击展开 / 收起": "Common scripts: click to expand / collapse",
+  "选择要加入「脚本」栏的 .jsx 文件：": "Select .jsx files to add to the Scripts bar:",
+  "目录里没有 .jsx": "No .jsx files in this folder",
+  "鼠标点击按钮为[设置]功能": "Click to open Settings"
+};
+
+var __EC_LANG = "zh";
+var __EC_LANG_LOADED = false;
+var __EC_I18N_WINS = [];
+
+function __ecLangEnsure() {
+  if (__EC_LANG_LOADED) return;
+  __EC_LANG_LOADED = true;
+  try {
+    var v = app.settings.getSetting("MyScript_Settings", "lang");
+    if (v === "en" || v === "zh") __EC_LANG = v;
+  } catch (e) {}
+}
+
+function __ecLangGet() {
+  __ecLangEnsure();
+  return __EC_LANG;
+}
+
+function __ecT(s) {
+  __ecLangEnsure();
+  if (__EC_LANG !== "en") return s;
+  var t = __EC_I18N[s];
+  return typeof t === "string" ? t : s;
+}
+
+function __ecI18nApplyText(node) {
+  if (!node) return;
+  // Window 的标题不是 text 属性，单独处理
+  var title = null;
+  try { title = node.title; } catch (e0) {}
+  if (typeof title === "string" && title.length && title !== "panel") {
+    if (__EC_LANG === "en") {
+      var enTitle = __EC_I18N[title];
+      if (typeof enTitle === "string" && enTitle !== title) {
+        node.__ecZhTitle = title;
+        try { node.title = enTitle; } catch (e0b) {}
+      }
+    } else if (node.__ecZhTitle) {
+      try { node.title = node.__ecZhTitle; } catch (e0c) {}
+      node.__ecZhTitle = null;
+    }
+  }
+  var t = null;
+  try { t = node.text; } catch (e) {}
+  if (typeof t === "string" && t.length) {
+    if (__EC_LANG === "en") {
+      var en = __EC_I18N[t];
+      if (typeof en === "string" && en !== t) {
+        node.__ecZhText = t;
+        try { node.text = en; } catch (e1) {}
+      }
+    } else if (node.__ecZhText) {
+      try { node.text = node.__ecZhText; } catch (e2) {}
+      node.__ecZhText = null;
+    }
+  }
+  var tip = null;
+  try { tip = node.helpTip; } catch (e3) {}
+  if (typeof tip === "string" && tip.length) {
+    if (__EC_LANG === "en") {
+      var enTip = __EC_I18N[tip];
+      if (typeof enTip === "string" && enTip !== tip) {
+        node.__ecZhTip = tip;
+        try { node.helpTip = enTip; } catch (e4) {}
+      }
+    } else if (node.__ecZhTip) {
+      try { node.helpTip = node.__ecZhTip; } catch (e5) {}
+      node.__ecZhTip = null;
+    }
+  }
+}
+
+function __ecI18nApply(node, depth) {
+  if (!node || depth > 40) return;
+  __ecI18nApplyText(node);
+  var kids = null;
+  try { kids = node.children; } catch (e) {}
+  if (kids && kids.length) {
+    for (var i = 0; i < kids.length; i++) __ecI18nApply(kids[i], depth + 1);
+  }
+  var items = null;
+  try { items = node.items; } catch (e2) {}
+  if (items && items.length) {
+    for (var j = 0; j < items.length; j++) {
+      var it = items[j];
+      var s = null;
+      try { s = it.text; } catch (e3) {}
+      if (typeof s !== "string" || !s.length) continue;
+      if (__EC_LANG === "en") {
+        var en = __EC_I18N[s];
+        if (typeof en === "string" && en !== s) {
+          it.__ecZhText = s;
+          try { it.text = en; } catch (e4) {}
+        }
+      } else if (it.__ecZhText) {
+        try { it.text = it.__ecZhText; } catch (e5) {}
+        it.__ecZhText = null;
+      }
+    }
+  }
+}
+
+function __ecI18nApplyWin(win) {
+  if (!win) return;
+  __ecLangEnsure();
+  // 切换语言时先把上次抛光撑大的 preferredSize 还原，再按当前语言重新翻译/抛光。
+  // 否则英文撑大后再切回中文，控件会保持英文尺寸，中文界面显得又空又大。
+  try { if (typeof __ecPolishReset === "function") __ecPolishReset(win); } catch (eR) {}
+  try { __ecI18nApply(win, 0); } catch (e) {}
+  // 英文比中文长，重新按文本宽度抛光一遍，避免标签被截断
+  try {
+    if (typeof __ecPolishLayout === "function") __ecPolishLayout(win);
+  } catch (e2) {}
+}
+
+// 面板 / tab 构建后调用
+function __ecApplyLang(root) {
+  __ecI18nApplyWin(root);
+}
+
+function __ecI18nRemember(win) {
+  for (var i = 0; i < __EC_I18N_WINS.length; i++) {
+    if (__EC_I18N_WINS[i] === win) return;
+  }
+  __EC_I18N_WINS.push(win);
+}
+
+function __ecI18nApplyAll() {
+  try { __ecI18nApplyWin($.global.__ecMainWin); } catch (e) {}
+  for (var i = 0; i < __EC_I18N_WINS.length; i++) {
+    __ecI18nApplyWin(__EC_I18N_WINS[i]);
+  }
+}
+
+function __ecLangSet(v) {
+  __ecLangEnsure();
+  var lang = v === "en" ? "en" : "zh";
+  __EC_LANG = lang;
+  try { app.settings.saveSetting("MyScript_Settings", "lang", lang); } catch (e) {}
+  __ecI18nApplyAll();
+}
+
+// 所有 ScriptUI 弹窗在 show 前自动翻译；并登记，方便运行时切换语言
+(function () {
+  try {
+    var proto = Window.prototype;
+    if (!proto || typeof proto.show !== "function" || proto.show.__ecI18n) return;
+    var orig = proto.show;
+    var wrapped = function () {
+      try {
+        __ecI18nRemember(this);
+        __ecI18nApplyWin(this);
+      } catch (e) {}
+      return orig.apply(this, arguments);
+    };
+    wrapped.__ecI18n = true;
+    proto.show = wrapped;
+  } catch (e) {}
+})();
 
 /*
  * ec-cmdmap.js — AE 数字命令 ID -> EffectCraft 菜单命令映射层
@@ -2590,6 +4036,682 @@ try {
   system.callSystem = function (c) { return __ecCallSystemEC(c); };
 } catch (eMount) {}
 
+// ===========================================================================
+// 工具箱大师 · EffectCraft 版「脚本」展开栏 + 自绘左侧导航
+// ---------------------------------------------------------------------------
+// EC 的 listbox 不能插非列表控件，所以左侧导航整体换成自绘的 group 列：
+//   - 5 个导航项（锚点工具 / 常用工具 / 合成工具 / 重置 / 脚本信息）
+//   - 在「重置」和「脚本信息」之间插入「脚本」展开栏：
+//       收起：一枚蓝色描边胶囊「脚本 Ｖ」
+//       展开：蓝色表头 + 常用脚本条目 + 「＋」，整体圆角描边
+//   - 「＋」从设置里的「常用脚本目录」挑 .jsx 并命名；条目右键可重命名 /
+//     删除 / 打开所在文件夹；左键 $.evalFile 运行（脚本自己的浮动窗由 EC 托管）
+//
+// 数据都存 app.settings（EC 只接受字符串），section/key 见下。
+// 依赖 compat.js 里的 __EC_PANELS_DIR / __ecShowNote。
+// ===========================================================================
+
+var __EC_SB_SECTION = "ToolBoxMaster_ScriptBar";
+var __EC_SB_KEY_ITEMS = "items";
+var __EC_SB_KEY_DIR = "dir";
+
+// 配色：[r, g, b, a]，0..1（和面板里的蓝色高亮一致）
+var __EC_SB_BLUE = [0.13, 0.60, 0.95, 1];
+var __EC_SB_SEL = [0.16, 0.46, 0.78, 1];
+var __EC_SB_HOVER = [0.15, 0.27, 0.38, 1];
+var __EC_SB_ITEM_HOVER = [0.12, 0.32, 0.50, 1];
+var __EC_SB_TEXT = [0.94, 0.96, 0.99, 1];
+var __EC_SB_CYAN = [0.45, 0.85, 1.0, 1];
+var __EC_SB_BG = [0.05, 0.07, 0.10, 0.60];
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+function __ecSBTrim(s) {
+  return String(s == null ? "" : s).replace(/^\s+|\s+$/g, "");
+}
+
+function __ecSBBaseName(p) {
+  var s = String(p == null ? "" : p).replace(/\\/g, "/");
+  var parts = s.split("/");
+  var name = parts.length ? parts[parts.length - 1] : s;
+  return name.replace(/\.js[x]?$/i, "");
+}
+
+function __ecSBDirName(p) {
+  var s = String(p == null ? "" : p).replace(/\\/g, "/");
+  var i = s.lastIndexOf("/");
+  return i > 0 ? s.substring(0, i) : s;
+}
+
+// ---------------------------------------------------------------------------
+// 设置：常用脚本目录 / 条目列表
+// ---------------------------------------------------------------------------
+function __ecSBDirDefault() {
+  var d = "";
+  try { d = String(__EC_PANELS_DIR || ""); } catch (e) {}
+  if (!d) {
+    try { d = String(__ecPanelDir() || ""); } catch (e2) {}
+  }
+  return d;
+}
+
+function __ecSBDirGet() {
+  var d = "";
+  try { d = String(app.settings.getSetting(__EC_SB_SECTION, __EC_SB_KEY_DIR) || ""); } catch (e) {}
+  d = __ecSBTrim(d);
+  return d || __ecSBDirDefault();
+}
+
+function __ecSBSetDir(v) {
+  var d = __ecSBTrim(v);
+  if (!d) d = __ecSBDirDefault();
+  try { app.settings.saveSetting(__EC_SB_SECTION, __EC_SB_KEY_DIR, d); } catch (e) {}
+  return d;
+}
+
+function __ecSBItemsLoad() {
+  var out = [];
+  var raw = "";
+  try { raw = String(app.settings.getSetting(__EC_SB_SECTION, __EC_SB_KEY_ITEMS) || ""); } catch (e) {}
+  if (!raw) return out;
+  try {
+    var arr = JSON.parse(raw);
+    if (arr && arr.length) {
+      for (var i = 0; i < arr.length; i++) {
+        var it = arr[i] || {};
+        var p = __ecSBTrim(it.path);
+        var n = __ecSBTrim(it.name);
+        if (!p) continue;
+        if (!n) n = __ecSBBaseName(p);
+        out.push({ path: p, name: n });
+      }
+    }
+  } catch (e2) {}
+  return out;
+}
+
+function __ecSBItemsSave(items) {
+  var arr = [];
+  for (var i = 0; i < items.length; i++) {
+    arr.push({ path: String(items[i].path || ""), name: String(items[i].name || "") });
+  }
+  try { app.settings.saveSetting(__EC_SB_SECTION, __EC_SB_KEY_ITEMS, JSON.stringify(arr)); } catch (e) {}
+}
+
+// ---------------------------------------------------------------------------
+// 绘制辅助：EC 没有 arcTo，圆角用多段 lineTo 近似
+// ---------------------------------------------------------------------------
+function __ecSBFont(size) {
+  try { return ScriptUI.newFont("dialog", "REGULAR", size); } catch (e) {}
+  return null;
+}
+
+function __ecSBBrush(g, color) {
+  return g.newBrush(g.BrushType.SOLID_COLOR, color);
+}
+
+function __ecSBPen(g, color, width) {
+  return g.newPen(g.PenType.SOLID_COLOR, color, width || 1);
+}
+
+// 单个圆角圆弧：center(cx,cy)，半径 r，从 a0 度画到 a1 度（屏幕坐标 y 向下）
+function __ecSBCorner(g, cx, cy, r, a0, a1) {
+  if (!(r > 0)) return;
+  var steps = 6;
+  for (var i = 1; i <= steps; i++) {
+    var a = (a0 + (a1 - a0) * (i / steps)) * Math.PI / 180;
+    g.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+  }
+}
+
+// 圆角矩形路径；r 可以是数字或 [左上, 右上, 右下, 左下]
+function __ecSBRoundPath(g, x, y, w, h, r) {
+  g.newPath();
+  if (!(w > 0 && h > 0)) return g.currentPath;
+  var rs = r instanceof Array ? r : [r, r, r, r];
+  var lim = Math.min(w, h) / 2;
+  var tl = Math.min(Number(rs[0]) || 0, lim);
+  var tr = Math.min(Number(rs[1]) || 0, lim);
+  var br = Math.min(Number(rs[2]) || 0, lim);
+  var bl = Math.min(Number(rs[3]) || 0, lim);
+  g.moveTo(x + tl, y);
+  g.lineTo(x + w - tr, y);
+  __ecSBCorner(g, x + w - tr, y + tr, tr, -90, 0);
+  g.lineTo(x + w, y + h - br);
+  __ecSBCorner(g, x + w - br, y + h - br, br, 0, 90);
+  g.lineTo(x + bl, y + h);
+  __ecSBCorner(g, x + bl, y + h - bl, bl, 90, 180);
+  g.lineTo(x, y + tl);
+  __ecSBCorner(g, x + tl, y + tl, tl, 180, 270);
+  g.closePath();
+  return g.currentPath;
+}
+
+function __ecSBFillRound(g, x, y, w, h, r, color) {
+  if (!(w > 0 && h > 0)) return;
+  var p = __ecSBRoundPath(g, x, y, w, h, r);
+  g.fillPath(__ecSBBrush(g, color), p);
+}
+
+function __ecSBStrokeRound(g, x, y, w, h, r, color, width) {
+  if (!(w > 0 && h > 0)) return;
+  var p = __ecSBRoundPath(g, x, y, w, h, r);
+  g.strokePath(__ecSBPen(g, color, width), p);
+}
+
+// 近似文字宽度：ASCII 窄，中文/全角宽
+function __ecSBTextW(s, size) {
+  var t = String(s == null ? "" : s);
+  var w = 0;
+  for (var i = 0; i < t.length; i++) {
+    var c = t.charCodeAt(i);
+    w += c > 0x2e80 ? size : size * 0.55;
+  }
+  return w;
+}
+
+function __ecSBClip(s, maxW, size) {
+  var t = String(s == null ? "" : s);
+  if (__ecSBTextW(t, size) <= maxW) return t;
+  var out = t;
+  while (out.length > 1 && __ecSBTextW(out + "…", size) > maxW) {
+    out = out.substring(0, out.length - 1);
+  }
+  return out + "…";
+}
+
+function __ecSBText(g, s, color, x, y, size) {
+  try {
+    g.drawString(String(s == null ? "" : s), __ecSBPen(g, color, 1), x, y, __ecSBFont(size || 12));
+  } catch (e) {}
+}
+
+// 等边三角形（dir>0 指向下，dir<0 指向上），以 (cx,cy) 为重心
+function __ecSBTriangle(g, color, cx, cy, dir, side) {
+  var s = side || 9;
+  var h = s * 0.8660254;
+  var baseY = dir > 0 ? cy - h / 3 : cy + h / 3;
+  var tipY = dir > 0 ? cy + (2 * h) / 3 : cy - (2 * h) / 3;
+  g.newPath();
+  g.moveTo(cx - s / 2, baseY);
+  g.lineTo(cx + s / 2, baseY);
+  g.lineTo(cx, tipY);
+  g.closePath();
+  g.fillPath(__ecSBBrush(g, color));
+}
+
+// ---------------------------------------------------------------------------
+// 提示窗（非阻塞 palette，避免面板里 alert 不可见）
+// ---------------------------------------------------------------------------
+function __ecSBNote(title, body) {
+  try { $.writeln("[工具箱大师·脚本栏] " + title + "\n" + body); } catch (e0) {}
+  try {
+    var w = new Window("palette", "工具箱大师 · 脚本");
+    w.orientation = "column";
+    w.alignChildren = ["fill", "top"];
+    w.margins = 14;
+    w.spacing = 8;
+    var t = w.add("statictext", undefined, String(title || ""), { multiline: true });
+    t.preferredSize = [420, 0];
+    if (body) {
+      var b = w.add("statictext", undefined, String(body), { multiline: true });
+      b.preferredSize = [420, 0];
+    }
+    var row = w.add("group");
+    row.alignment = ["center", "top"];
+    var ok = row.add("button", undefined, "确定");
+    ok.preferredSize = [88, 24];
+    ok.onClick = function () { try { w.close(); } catch (e) {} };
+    w.show();
+  } catch (e) {
+    try { alert(title + "\n" + body); } catch (e2) {}
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 运行 / 菜单 / 增删改
+// ---------------------------------------------------------------------------
+function __ecSBRunItem(item) {
+  if (!item || !item.path) return;
+  var f = null;
+  try { f = new File(item.path); } catch (e0) {}
+  if (!f || !f.exists) {
+    __ecSBNote("脚本不存在", String(item.name || "") + "\n" + String(item.path || ""));
+    return;
+  }
+  try {
+    $.evalFile(f);
+  } catch (e) {
+    var msg = "";
+    try { msg = String(e && e.message ? e.message : e); } catch (e2) {}
+    if (msg.indexOf("__EC_NEEDS_MANUAL_LAUNCH__") >= 0) return;
+    __ecSBNote("脚本运行失败", String(item.name || "") + "\n" + msg);
+  }
+}
+
+// EC 启动不了资源管理器，只能把目录/文件路径完整显示出来
+function __ecSBReveal(path) {
+  var dir = __ecSBDirName(path);
+  __ecSBNote("脚本所在文件夹", "EffectCraft 里脚本不能替你打开资源管理器，请手动打开：\n" + dir + "\n\n文件：\n" + String(path || ""));
+}
+
+function __ecSBDeleteItem(item) {
+  if (!item) return false;
+  var items = __ecSBItemsLoad();
+  var out = [];
+  for (var i = 0; i < items.length; i++) {
+    if (String(items[i].path) !== String(item.path)) out.push(items[i]);
+  }
+  __ecSBItemsSave(out);
+  return true;
+}
+
+function __ecSBRenameFlow(item) {
+  if (!item) return false;
+  var oldName = String(item.name || "");
+  var w = new Window("dialog", "重命名脚本");
+  w.orientation = "column";
+  w.alignChildren = ["fill", "top"];
+  w.margins = 14;
+  w.spacing = 8;
+  var t = w.add("statictext", undefined, "给「" + oldName + "」设置新的显示名称：");
+  t.preferredSize = [340, 0];
+  var input = w.add("edittext", undefined, oldName);
+  input.characters = 24;
+  input.preferredSize = [340, 24];
+  var row = w.add("group");
+  row.alignment = ["center", "top"];
+  row.spacing = 6;
+  var ok = row.add("button", undefined, "确定");
+  ok.preferredSize = [88, 24];
+  var cancel = row.add("button", undefined, "取消");
+  cancel.preferredSize = [88, 24];
+  var result = false;
+  ok.onClick = function () {
+    var n = __ecSBTrim(input.text);
+    if (!n) n = oldName;
+    var items = __ecSBItemsLoad();
+    for (var i = 0; i < items.length; i++) {
+      if (String(items[i].path) === String(item.path)) items[i].name = n;
+    }
+    __ecSBItemsSave(items);
+    result = true;
+    try { w.close(1); } catch (e) {}
+  };
+  cancel.onClick = function () { try { w.close(0); } catch (e) {} };
+  try { w.show(); } catch (e2) {}
+  return result;
+}
+
+function __ecSBItemMenu(item, onChange) {
+  if (!item) return;
+  var action = "";
+  var w = new Window("dialog", "脚本");
+  w.orientation = "column";
+  w.alignChildren = ["fill", "top"];
+  w.margins = 14;
+  w.spacing = 8;
+
+  var nameT = w.add("statictext", undefined, "名称：" + String(item.name || ""));
+  nameT.preferredSize = [420, 0];
+  var pathT = w.add("statictext", undefined, "路径：" + String(item.path || ""), { multiline: true });
+  pathT.preferredSize = [420, 0];
+
+  var row1 = w.add("group");
+  row1.orientation = "row";
+  row1.alignment = ["fill", "top"];
+  row1.spacing = 6;
+  var bReveal = row1.add("button", undefined, "打开所在文件夹");
+  bReveal.preferredSize = [140, 24];
+  var bRename = row1.add("button", undefined, "重命名");
+  bRename.preferredSize = [88, 24];
+  var bDelete = row1.add("button", undefined, "删除");
+  bDelete.preferredSize = [88, 24];
+  var bCancel = row1.add("button", undefined, "取消");
+  bCancel.preferredSize = [88, 24];
+
+  bReveal.onClick = function () { action = "reveal"; try { w.close(1); } catch (e) {} };
+  bRename.onClick = function () { action = "rename"; try { w.close(1); } catch (e) {} };
+  bDelete.onClick = function () { action = "delete"; try { w.close(1); } catch (e) {} };
+  bCancel.onClick = function () { try { w.close(0); } catch (e) {} };
+
+  try { w.show(); } catch (e2) {}
+
+  var changed = false;
+  if (action === "reveal") __ecSBReveal(item.path);
+  else if (action === "rename") changed = __ecSBRenameFlow(item);
+  else if (action === "delete") changed = __ecSBDeleteItem(item);
+  if (changed && typeof onChange === "function") onChange();
+}
+
+// 「＋」：从常用脚本目录挑 .jsx，填显示名后加入
+function __ecSBAddFlow() {
+  var dir = __ecSBDirGet();
+  var folder = null;
+  try { folder = new Folder(dir); } catch (e0) {}
+  if (!folder || !folder.exists) {
+    __ecSBNote("脚本目录不存在", "请先在设置里填写可用的脚本目录：\n" + dir);
+    return false;
+  }
+
+  var files = [];
+  try {
+    var list = folder.getFiles("*.jsx");
+    for (var i = 0; i < list.length; i++) {
+      try {
+        if (list[i] instanceof File) files.push(list[i]);
+      } catch (e1) {}
+    }
+  } catch (e2) {}
+  files.sort(function (a, b) {
+    var x = String(a && a.name || "").toLowerCase();
+    var y = String(b && b.name || "").toLowerCase();
+    return x < y ? -1 : (x > y ? 1 : 0);
+  });
+
+  if (!files.length) {
+    __ecSBNote("目录里没有 .jsx", "目录：" + dir);
+    return false;
+  }
+
+  var w = new Window("dialog", "添加常用脚本");
+  w.orientation = "column";
+  w.alignChildren = ["fill", "top"];
+  w.margins = 14;
+  w.spacing = 8;
+
+  var hint = w.add("statictext", undefined, "选择要加入「脚本」栏的 .jsx 文件：");
+  hint.preferredSize = [440, 0];
+
+  var list = w.add("listbox", undefined, []);
+  list.preferredSize = [440, 190];
+  for (var k = 0; k < files.length; k++) list.add("item", String(files[k].name));
+  list.selection = 0;
+
+  var row = w.add("group");
+  row.orientation = "row";
+  row.alignChildren = ["left", "center"];
+  row.spacing = 6;
+  var label = row.add("statictext", undefined, "显示名称");
+  var nameInput = row.add("edittext", undefined, __ecSBBaseName(files[0].fsName));
+  nameInput.characters = 24;
+  nameInput.preferredSize = [300, 24];
+
+  list.onChange = function () {
+    var sel = null;
+    try { sel = list.selection; } catch (e3) {}
+    if (!sel) return;
+    var idx = Number(sel.index);
+    if (isNaN(idx) || idx < 0 || idx >= files.length) return;
+    try { nameInput.text = __ecSBBaseName(files[idx].fsName); } catch (e4) {}
+  };
+
+  var btnRow = w.add("group");
+  btnRow.alignment = ["center", "top"];
+  btnRow.spacing = 6;
+  var addBtn = btnRow.add("button", undefined, "添加");
+  addBtn.preferredSize = [88, 24];
+  var cancelBtn = btnRow.add("button", undefined, "取消");
+  cancelBtn.preferredSize = [88, 24];
+
+  var added = false;
+  addBtn.onClick = function () {
+    var idx = 0;
+    var sel = null;
+    try { sel = list.selection; } catch (e5) {}
+    if (sel) {
+      var n = Number(sel.index);
+      if (!isNaN(n)) idx = n;
+    }
+    if (idx < 0 || idx >= files.length) return;
+    var path = String(files[idx].fsName);
+    var name = __ecSBTrim(nameInput.text);
+    if (!name) name = __ecSBBaseName(path);
+
+    var items = __ecSBItemsLoad();
+    var found = false;
+    for (var m = 0; m < items.length; m++) {
+      if (String(items[m].path) === path) {
+        items[m].name = name;
+        found = true;
+        break;
+      }
+    }
+    if (!found) items.push({ path: path, name: name });
+    __ecSBItemsSave(items);
+    added = true;
+    try { w.close(1); } catch (e6) {}
+  };
+  cancelBtn.onClick = function () { try { w.close(0); } catch (e7) {} };
+
+  try { w.show(); } catch (e8) {}
+  return added;
+}
+
+// ---------------------------------------------------------------------------
+// 绘制回调
+// ---------------------------------------------------------------------------
+function __ecSBRootDraw() {
+  var st = this.__ecState;
+  if (!st || !st.open) return;
+  var g = this.graphics;
+  var sz = null;
+  try { sz = this.size; } catch (e) {}
+  var w = sz ? Number(sz[0]) : 0;
+  var h = sz ? Number(sz[1]) : 0;
+  if (!(w > 2 && h > 2)) return;
+  __ecSBFillRound(g, 0, 0, w, h, 10, __EC_SB_BG);
+  // 描边内缩半个像素，避免与填充之间出现 1px 缝隙
+  __ecSBStrokeRound(g, 0.5, 0.5, w - 1, h - 1, 10, __EC_SB_BLUE, 1);
+}
+
+function __ecSBHeaderDraw() {
+  var g = this.graphics;
+  var sz = null;
+  try { sz = this.size; } catch (e) {}
+  var w = sz ? Number(sz[0]) : 110;
+  var h = sz ? Number(sz[1]) : 25;
+  if (!(w > 2 && h > 2)) return;
+  var st = this.__ecState;
+  var open = !!(st && st.open);
+  var pressed = !!(st && st.pressed);
+  var size = 12;
+  if (pressed) {
+    // 点击瞬间才高亮；展开后不再常亮
+    if (open) __ecSBFillRound(g, 1, 1, w - 2, h - 1, [9, 9, 0, 0], __EC_SB_BLUE);
+    else __ecSBFillRound(g, 2, 1.5, w - 4, h - 3, (h - 3) / 2, __EC_SB_BLUE);
+  }
+  if (!open) {
+    __ecSBStrokeRound(g, 2, 1.5, w - 4, h - 3, (h - 3) / 2, __EC_SB_BLUE, 1.5);
+  }
+  var label = (typeof __ecT === "function") ? String(__ecT("脚本")) : "脚本";
+  var tw = __ecSBTextW(label, size);
+  var gap = 5, cw = 5;
+  var total = tw + gap + cw * 2;
+  var tx = Math.max(8, Math.round((w - total) / 2));
+  var ty = Math.round((h - size * 1.25) / 2);
+  __ecSBText(g, label, __EC_SB_TEXT, tx, ty, size);
+  __ecSBTriangle(g, __EC_SB_TEXT, tx + tw + gap + cw, h / 2, open ? -1 : 1, 9);
+}
+
+function __ecSBItemDraw() {
+  var g = this.graphics;
+  var sz = null;
+  try { sz = this.size; } catch (e) {}
+  var w = sz ? Number(sz[0]) : 96;
+  var h = sz ? Number(sz[1]) : 24;
+  if (!(w > 2 && h > 2)) return;
+  __ecSBStrokeRound(g, 1, 1, w - 2, h - 2, (h - 2) / 2, __EC_SB_BLUE, 1);
+  var size = 11;
+  var label = __ecSBClip(this.__ecLabel || "", w - 14, size);
+  var tw = __ecSBTextW(label, size);
+  var tx = Math.max(7, Math.round((w - tw) / 2));
+  var ty = Math.round((h - size * 1.25) / 2);
+  __ecSBText(g, label, __EC_SB_CYAN, tx, ty, size);
+}
+
+function __ecSBPlusDraw() {
+  var g = this.graphics;
+  var sz = null;
+  try { sz = this.size; } catch (e) {}
+  var w = sz ? Number(sz[0]) : 96;
+  var h = sz ? Number(sz[1]) : 24;
+  if (!(w > 2 && h > 2)) return;
+  __ecSBStrokeRound(g, 1, 1, w - 2, h - 2, (h - 2) / 2, __EC_SB_BLUE, 1);
+  var size = 15;
+  var tw = __ecSBTextW("+", size);
+  var tx = Math.round((w - tw) / 2);
+  var ty = Math.round((h - size * 1.25) / 2);
+  __ecSBText(g, "+", __EC_SB_CYAN, tx, ty, size);
+}
+
+function __ecSBNavButtonDraw() {
+  var g = this.graphics;
+  var sz = null;
+  try { sz = this.size; } catch (e) {}
+  var w = sz ? Number(sz[0]) : 110;
+  var h = sz ? Number(sz[1]) : 25;
+  if (!(w > 2 && h > 2)) return;
+  if (this.__ecSel) {
+    __ecSBFillRound(g, 1, 1, w - 2, h - 2, 4, __EC_SB_SEL);
+  }
+  var size = 12;
+  var rawLabel = String(this.__ecLabel || "");
+  var label = (typeof __ecT === "function") ? String(__ecT(rawLabel)) : rawLabel;
+  var tw = __ecSBTextW(label, size);
+  var tx = Math.max(6, Math.round((w - tw) / 2));
+  var ty = Math.round((h - size * 1.25) / 2);
+  __ecSBText(g, label, __EC_SB_TEXT, tx, ty, size);
+}
+
+// ---------------------------------------------------------------------------
+// 构建脚本展开栏
+// ---------------------------------------------------------------------------
+function __ecBuildScriptBar(parent) {
+  var root = parent.add("group", undefined, undefined, { name: "ecScriptBar" });
+  root.__ecFreeLayout = true;
+  root.orientation = "column";
+  root.alignChildren = ["fill", "top"];
+  root.spacing = 0;
+  root.margins = [0, 0, 0, 0];
+  root.preferredSize = [110, 0];
+
+  var state = { open: false, items: __ecSBItemsLoad() };
+  root.__ecState = state;
+  root.onDraw = __ecSBRootDraw;
+
+  var header = root.add("button", undefined, "");
+  header.__ecFreeLayout = true;
+  header.preferredSize = [110, 25];
+  header.__ecState = state;
+  header.helpTip = "常用脚本：点击展开 / 收起";
+  header.onDraw = __ecSBHeaderDraw;
+  header.addEventListener("mousedown", function () { state.pressed = true; });
+  header.addEventListener("mouseup", function () { state.pressed = false; });
+  header.addEventListener("mouseout", function () { state.pressed = false; });
+
+  var body = root.add("group", undefined, undefined, { name: "ecScriptBarBody" });
+  body.__ecFreeLayout = true;
+  body.orientation = "column";
+  body.alignChildren = ["fill", "top"];
+  body.spacing = 3;
+  body.margins = [6, 4, 6, 5];
+  body.visible = false;
+
+  var bar = { root: root, header: header, body: body, state: state, refresh: null };
+  root.__ecBar = bar;
+
+  header.onClick = function () {
+    state.open = !state.open;
+    try { body.visible = state.open; } catch (e) {}
+  };
+
+  function refresh() {
+    try { body.removeAll(); } catch (e0) {}
+    var items = __ecSBItemsLoad();
+    state.items = items;
+    for (var i = 0; i < items.length; i++) {
+      (function (item) {
+        var b = body.add("button", undefined, "");
+        b.__ecFreeLayout = true;
+        b.preferredSize = [96, 24];
+        b.__ecLabel = String(item.name || "");
+        b.__ecItem = item;
+        b.helpTip = String(item.name || "") + "\n" + String(item.path || "");
+        b.onDraw = __ecSBItemDraw;
+        b.addEventListener("mousedown", function (e) {
+          if (!e || Number(e.button) !== 2) return;
+          __ecSBItemMenu(item, refresh);
+        });
+        b.onClick = function () { __ecSBRunItem(item); };
+      })(items[i]);
+    }
+    var plus = body.add("button", undefined, "");
+    plus.__ecFreeLayout = true;
+    plus.preferredSize = [96, 24];
+    plus.helpTip = "添加常用脚本";
+    plus.onDraw = __ecSBPlusDraw;
+    plus.onClick = function () {
+      if (__ecSBAddFlow()) refresh();
+    };
+  }
+
+  bar.refresh = refresh;
+  refresh();
+  return bar;
+}
+
+// ---------------------------------------------------------------------------
+// 构建左侧导航列（替代原 listbox）
+// ---------------------------------------------------------------------------
+function __ecBuildNav(parent, labels, onSelect) {
+  var col = parent.add("group", undefined, undefined, { name: "ecNavColumn" });
+  col.__ecFreeLayout = true;
+  col.orientation = "column";
+  col.alignChildren = ["fill", "top"];
+  col.spacing = 3;
+  col.margins = [1, 2, 1, 2];
+  col.preferredSize = [110, 0];
+
+  var list = labels || [];
+  var last = list.length - 1;
+  var buttons = [];
+  var bar = null;
+
+  for (var i = 0; i < list.length; i++) {
+    if (i === last) bar = __ecBuildScriptBar(col);
+    var b = col.add("button", undefined, "");
+    b.__ecFreeLayout = true;
+    b.preferredSize = [110, 25];
+    b.__ecIndex = i;
+    b.__ecLabel = String(list[i] || "");
+    b.helpTip = b.__ecLabel;
+    b.onDraw = __ecSBNavButtonDraw;
+    buttons.push(b);
+  }
+
+  var nav = { column: col, buttons: buttons, bar: bar, selected: -1, select: null };
+  function select(idx) {
+    idx = Number(idx) || 0;
+    for (var k = 0; k < buttons.length; k++) buttons[k].__ecSel = (k === idx);
+    nav.selected = idx;
+    if (typeof onSelect === "function") onSelect(idx);
+  }
+  nav.select = select;
+
+  for (var j = 0; j < buttons.length; j++) {
+    (function (btn) {
+      btn.__ecNav = nav;
+      btn.onClick = function () {
+        try { btn.__ecNav.select(btn.__ecIndex); } catch (e) {}
+      };
+    })(buttons[j]);
+  }
+
+  return nav;
+}
+
 // ============================================================
 // 检查 ToolBoxMasterPath.txt
 // 如果内容是默认占位路径，则弹出路径设置窗口
@@ -4197,6 +6319,33 @@ shezhiButton.onClick = function () {
     var frameInput = panel2.add("edittext", undefined, frameValue.toString()); // 加载记忆的帧值
     frameInput.characters = 2; // 设置输入框字符长度
     var zhen = panel2.add("statictext", undefined, "帧");
+
+    // 常用脚本目录：左侧「脚本」展开栏的「＋」从这里挑 .jsx
+    var panelScriptDir = panel.add("group");
+    panelScriptDir.orientation = "row";
+    panelScriptDir.alignChildren = ["left", "center"];
+    panelScriptDir.spacing = 6;
+    panelScriptDir.margins = [10, 0, 10, 0];
+    panelScriptDir.add("statictext", undefined, "常用脚本目录");
+    var scriptDirInput = panelScriptDir.add("edittext", undefined, __ecSBDirGet());
+    scriptDirInput.characters = 24;
+    scriptDirInput.preferredSize = [260, 24];
+    var scriptDirDefaultBtn = panelScriptDir.add("button", undefined, "默认");
+    scriptDirDefaultBtn.preferredSize = [64, 24];
+    scriptDirDefaultBtn.helpTip = "恢复为 EffectCraft 的脚本目录（ScriptUI Panels）";
+    scriptDirDefaultBtn.onClick = function () {
+        try { scriptDirInput.text = __ecSBDirDefault(); } catch (ecScriptDirErr) {}
+    };
+
+    // 界面语言：默认中文，勾选 English 后整个面板与弹窗切英文
+    var panelScriptLang = panel.add("group");
+    panelScriptLang.orientation = "row";
+    panelScriptLang.alignChildren = ["left", "center"];
+    panelScriptLang.spacing = 8;
+    panelScriptLang.margins = [10, 0, 10, 0];
+    panelScriptLang.add("statictext", undefined, "界面语言");
+    var englishCheck = __ecLabeled(panelScriptLang, "checkbox", "English");
+    englishCheck.value = (__ecLangGet() === "en");
     
     
 
@@ -4438,7 +6587,7 @@ loadToolBoxMasterPath();
     panelUpdate.spacing = 6;
     panelUpdate.margins = 10;
     panelUpdate.alignChildren = ["center", "center"];
-    panelUpdate.add("statictext", undefined, "当前版本：v" + TOOLBOX_SCRIPT_VERSION);
+    panelUpdate.add("statictext", undefined, __ecT("当前版本：") + "v" + TOOLBOX_SCRIPT_VERSION);
     var updateCheckBtn = panelUpdate.add("button", undefined, "检测更新");
     updateCheckBtn.helpTip = "从 GitHub 检测并更新 工具箱大师.jsx";
     updateCheckBtn.onClick = function () {
@@ -4491,6 +6640,20 @@ loadToolBoxMasterPath();
             frameValue.toString()
         );
 
+        // 保存「脚本」展开栏的常用脚本目录
+        try {
+            if (typeof scriptDirInput !== "undefined" && scriptDirInput) {
+                __ecSBSetDir(String(scriptDirInput.text || ""));
+            }
+        } catch (ecScriptDirSaveErr) {}
+
+        // 保存界面语言并立即应用
+        try {
+            if (typeof englishCheck !== "undefined" && englishCheck) {
+                __ecLangSet(englishCheck.value ? "en" : "zh");
+            }
+        } catch (ecLangSaveErr) {}
+
 
     }
     catch(e)
@@ -4519,14 +6682,6 @@ loadToolBoxMasterPath();
         }
     }
 
-        // 根据复选框的值，更新主窗口按钮的行为
-        if (alignEnabled) {
-            Button3.text = "%C2%89PNG%0D%0A%1A%0A%00%00%00%0DIHDR%00%00%00P%00%00%00%14%08%06%00%00%00%1A%C3%98%C2%BA%C3%97%00%00%01%2BIDATX%C2%85%C3%AD%C3%98%3D%C2%8A%C2%850%14%05%C3%A0%C2%A3N%2B%C2%82%60e!.%40p%09V%C3%96v%C3%96%C3%AE(%C2%B5%C2%AB%11%5C%C2%81e%C2%BA%C2%B1%C2%88%C2%85%22Xi%C2%99i%5E%C3%80%C3%82%C2%9Fy3d%C3%B22%2F_%C3%A7!%C2%B9%5E%241(%60%18%C3%86%C2%89%C3%8F%07%C3%95%7D%5C%C2%B1d%14%C3%B5%3C%C3%8F%C2%8B%C3%A38~v%C3%9E0%0C%C3%838%C2%8E%C2%A3%C2%B8%C3%A6%C2%9Cs%00%C2%B0%2C%C3%AB%C2%B0%C3%8F0%0C%C3%83%20%08%02%00%C2%98%C2%A6ib%C2%8C%C2%B1%C2%AB%5C%1BEQ%14%C3%BC%07%C3%A6y%C2%9E%C3%B7uD~v%1FB%08%11c%08!%C3%A4.%C2%97%C3%A1CF%C3%91u%5D%C3%97%C2%BE%C3%AF%C3%BBg%C3%A6DQ%14%C3%B9%C2%BE%C3%AF%C3%9F%C2%8Dk%C2%9A%C2%A6%01%C2%80%2C%C3%8B2%C3%86%18%C3%AB%C2%BA%C2%AE%03%C2%80%C3%BD*%3B%C3%8B%C3%BF%C2%B5%C2%A3%C3%95%C3%B6%C3%9DL%25%5Bu%03%C2%BA%C2%93%C2%B2%C2%85e%C2%AA%C2%AA%C2%AAR%C3%9D%C3%83K%C3%92a%C2%BB%1E1%5B%C3%B8%C2%97%C2%B4%7B%C2%80%C3%8D%C2%83%C3%AA%3E%5E%C2%8E9%C2%85%C3%9F%C2%94%C2%94S8%C3%8F%C3%B3%C2%BC%C2%AE%C3%ABZF%C3%AD%C3%BD)%C3%9C%C2%B6m%C3%AB%C2%BA%C2%AE%0B%00eY%C2%96%C2%94Rz%C2%95k%C3%A3%C2%AF%3E%C3%A5%C2%96eY%C3%84%C2%984M%C3%93%C2%BB%5C%06%C2%AD%7F%26%24I%C2%928%C2%8E%C3%A3%00%00%C2%A5%C2%94n%C3%9B%C2%B6%5D%C3%A5oG%C3%BC%C3%8E%C2%B2m%C3%9B%C2%BC%C2%AB%0D%C3%A3%C3%90%17%C3%B1%11v%C2%BE%C3%9Ch%C3%87%C2%A4%00%00%00%00IEND%C2%AEB%60%C2%82"; 
-            Button3.enabled = true;  // 启用按钮
-        } else {
-            Button3.text = "%C2%89PNG%0D%0A%1A%0A%00%00%00%0DIHDR%00%00%00P%00%00%00%14%08%06%00%00%00%1A%C3%98%C2%BA%C3%97%00%00%01%2BIDATX%C2%85%C3%AD%C3%98%3D%C2%8A%C2%850%14%05%C3%A0%C2%A3N%2B%C2%82%60e!.%40p%09V%C3%96v%C3%96%C3%AE(%C2%B5%C2%AB%11%5C%C2%81e%C2%BA%C2%B1%C2%88%C2%85%22Xi%C2%99i%5E%C3%80%C3%82%C2%9Fy3d%C3%B22%2F_%C3%A7!%C2%B9%5E%241(%60%18%C3%86%C2%89%C3%8F%07%C3%95%7D%5C%C2%B1d%14%C3%B5%3C%C3%8F%C2%8B%C3%A38~v%C3%9E0%0C%C3%838%C2%8E%C2%A3%C2%B8%C3%A6%C2%9Cs%00%C2%B0%2C%C3%AB%C2%B0%C3%8F0%0C%C3%83%20%08%02%00%C2%98%C2%A6ib%C2%8C%C2%B1%C2%AB%5C%1BEQ%14%C3%BC%07%C3%A6y%C2%9E%C3%B7uD~v%1FB%08%11c%08!%C3%A4.%C2%97%C3%A1CF%C3%91u%5D%C3%97%C2%BE%C3%AF%C3%BBg%C3%A6DQ%14%C3%B9%C2%BE%C3%AF%C3%9F%C2%8Dk%C2%9A%C2%A6%01%C2%80%2C%C3%8B2%C3%86%18%C3%AB%C2%BA%C2%AE%03%C2%80%C3%BD*%3B%C3%8B%C3%BF%C2%B5%C2%A3%C3%95%C3%B6%C3%9DL%25%5Bu%03%C2%BA%C2%93%C2%B2%C2%85e%C2%AA%C2%AA%C2%AAR%C3%9D%C3%83K%C3%92a%C2%BB%1E1%5B%C3%B8%C2%97%C2%B4%7B%C2%80%C3%8D%C2%83%C3%AA%3E%5E%C2%8E9%C2%85%C3%9F%C2%94%C2%94S8%C3%8F%C3%B3%C2%BC%C2%AE%C3%ABZF%C3%AD%C3%BD)%C3%9C%C2%B6m%C3%AB%C2%BA%C2%AE%0B%00eY%C2%96%C2%94Rz%C2%95k%C3%A3%C2%AF%3E%C3%A5%C2%96eY%C3%84%C2%984M%C3%93%C2%BB%5C%06%C2%AD%7F%26%24I%C2%928%C2%8E%C3%A3%00%00%C2%A5%C2%94n%C3%9B%C2%B6%5D%C3%A5oG%C3%BC%C3%8E%C2%B2m%C3%9B%C2%BC%C2%AB%0D%C3%A3%C3%90%17%C3%B1%11v%C2%BE%C3%9Ch%C3%87%C2%A4%00%00%00%00IEND%C2%AEB%60%C2%82"; 
-            Button3.enabled = true;  // 禁用按钮
-        }
     
     // 更新属性按钮状态
 function updateButtonBehavior(frameValue) {
@@ -4551,7 +6706,7 @@ function updateButtonBehavior(frameValue) {
     };
 
     // 显示弹窗窗口
-    try { __ecPolishLayout(popUpWindow); } catch (ecPolishErr2) {} popUpWindow.show();
+    try { __ecPolishLayout(popUpWindow); __ecStyleSettingsWindow(popUpWindow); } catch (ecPolishErr2) {} popUpWindow.show();
 };
 //=========================
 // 启动读取
@@ -4570,24 +6725,16 @@ verticalTabbedPanel.graphics.backgroundColor =
 verticalTabbedPanel.alignChildren = ["fill", "fill"];
 
 // 左侧标签
-var nav = verticalTabbedPanel.add("listbox", undefined, [
+var __ecNav = __ecBuildNav(verticalTabbedPanel, [
     "锚点工具",
     "常用工具",
     "合成工具",
     "重置",
     "脚本信息"
-]);
-
-var g = nav.graphics;
-var whitePen = g.newPen(
-    g.PenType.SOLID_COLOR,
-    [1, 1, 1, 1], // 白色 1,1,1,1    红色1,0,0,1
-    1
-);
-g.foregroundColor = whitePen;
-
-nav.preferredSize.width = 110;
-nav.itemSize = [undefined, 25];  // 每格高度25
+], function (__ecIndex) {
+    var __ecOrder = [0, 1, 2, 7, 12];
+    showTab(__ecOrder[__ecIndex]);
+});
 
 // 右侧内容 stack
 var contentWrapper = verticalTabbedPanel.add("group");
@@ -9787,7 +11934,7 @@ function CHANGESelectedKeyframeInterpolation(interpolationType) {
     var nextBtn, G, G_1, G1, gBtn, btn1, btn2, G2;
     var btn3, G2_1, FurikakeButton, FurikakeButton2, FurikakeButton3, RainButton, FurikakeButton4, BacklightButton;
     var HalftoneButton, tabGPT, GPTbutton, importGPTbutton, tabGPT2, OpenGPTbutton, compositionGroup7, mianze;
-    var image2_imgString, image2, iconButtonBilibili, iconButtonTEXT, iconButtonmikan, iconButtonlookae;
+    var image2_imgString, image2, ecGithubRow, iconButtonECGithub, iconButtonBilibili, iconButtonTEXT, iconButtonmikan, iconButtonlookae;
 
     var tab2 = null;
     __ecTabBuilders[1] = function () {
@@ -12076,7 +14223,7 @@ $.global.deleteSelectedLayerMasks = function() {
 }
     
 // 添加按钮
-preComp = buttonRow1.add("panel", undefined,"预合成");
+preComp = buttonRow1.add("group");
 preComp.orientation = "column";  // 垂直布局
 preComp.alignChildren = ["center", "center"];
 preComp.spacing = 2;
@@ -19704,13 +21851,23 @@ panel1.add("statictext", undefined, "感谢大家的理解与支持！");
     };
 
     // 显示弹窗窗口
-    try { __ecPolishLayout(popUpWindow); } catch (ecPolishErr2) {} popUpWindow.show();
+    try { __ecPolishLayout(popUpWindow); __ecStyleSettingsWindow(popUpWindow); } catch (ecPolishErr2) {} popUpWindow.show();
 };
     
     // 在"信息"选项卡中添加内容
     buttonRow2.add("statictext", undefined, "作者：小庄掌门");
     buttonRow2.add("statictext", undefined, "参与优化脚本:@CNLonely");
     buttonRow2.add("statictext", undefined, "灵感来源:@payynuz @Xezem");
+    buttonRow2.add("statictext", undefined, "EC版作者：KOGGUA");
+    ecGithubRow = buttonRow2.add("group");
+    ecGithubRow.orientation = "row";
+    ecGithubRow.alignment = ["center", "top"];
+    ecGithubRow.spacing = 0;
+    iconButtonECGithub = ecGithubRow.add("button", undefined, "EC版 GitHub 仓库"); iconButtonECGithub.preferredSize = [132, 25];;
+    iconButtonECGithub.helpTip = "https://github.com/KOGGUA-EDIT/gongjuxiangdashi/tree/ec-port";
+    iconButtonECGithub.onClick = function () {
+        __ecOpenUrl("https://github.com/KOGGUA-EDIT/gongjuxiangdashi/tree/ec-port");
+    };
 
     
 
@@ -19751,7 +21908,7 @@ panel1.add("statictext", undefined, "感谢大家的理解与支持！");
     };
 
     // ===== [lazy-tabs] 以下函数原在 tab2..tab13 块里，按原版作用域提到这里 =====
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：Deframe（原第 7417 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：Deframe（原第 7442 行）
 function Deframe() { 
     // 确保有选中合成
     var comp = app.project.activeItem;
@@ -19792,7 +21949,7 @@ function Deframe() {
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：reverseSelectedLayersOrderVisibleDown（原第 7492 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：reverseSelectedLayersOrderVisibleDown（原第 7517 行）
 function reverseSelectedLayersOrderVisibleDown() {
     Swap();
     var comp = app.project.activeItem;
@@ -19833,7 +21990,7 @@ function reverseSelectedLayersOrderVisibleDown() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：Swap（原第 7532 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：Swap（原第 7557 行）
 function Swap(){
 // 获取当前合成
 var comp = app.project.activeItem;
@@ -19855,7 +22012,7 @@ if (comp && comp instanceof CompItem) {
 }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：sortLayers（原第 7566 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：sortLayers（原第 7591 行）
 function sortLayers() {
     var comp = app.project.activeItem;
     if (comp == undefined || comp == null || !(comp instanceof CompItem)) {
@@ -19912,13 +22069,13 @@ function sortLayers() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：motiontilebutton_A（原第 7684 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：motiontilebutton_A（原第 7709 行）
 function motiontilebutton_A() {
     var value = getMotionTileValue();
     addRepeTileEffect(value);
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：motiontilebutton_B（原第 7689 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：motiontilebutton_B（原第 7714 行）
 function motiontilebutton_B() {
     var comp = app.project.activeItem;
     if (!comp || !(comp instanceof CompItem)) {
@@ -19936,12 +22093,12 @@ function motiontilebutton_B() {
     addDynamicTileEffect(selectedLayers, value);
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getMotionTileValue（原第 7707 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getMotionTileValue（原第 7732 行）
 function getMotionTileValue() {
     return parseInt(motiontileDropdown.selection.text);
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：addRepeTileEffect（原第 7712 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：addRepeTileEffect（原第 7737 行）
 function addRepeTileEffect(value) {
     var comp = app.project.activeItem;
     if (!comp || !(comp instanceof CompItem)) {
@@ -19973,7 +22130,7 @@ function addRepeTileEffect(value) {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：addDynamicTileEffect（原第 7744 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：addDynamicTileEffect（原第 7769 行）
 function addDynamicTileEffect(selectedLayers, value) {
     if (isNaN(value) || value < 100 || value > 500) {
         alert("您选择的数值无效！请选择范围为 100 到 500 的有效选项。");
@@ -19991,7 +22148,7 @@ function addDynamicTileEffect(selectedLayers, value) {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：JAWSrunA（原第 7813 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：JAWSrunA（原第 7838 行）
 function JAWSrunA() {
             app.beginUndoGroup("jaws");
             var comp = app.project.activeItem;  // 获取当前合成
@@ -20035,7 +22192,7 @@ function JAWSrunA() {
             app.endUndoGroup();
         }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：JAWSrunB（原第 7856 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：JAWSrunB（原第 7881 行）
 function JAWSrunB() {
     app.beginUndoGroup("Add Black Bars");
     JawsADD();
@@ -20043,7 +22200,7 @@ function JAWSrunB() {
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：JawsADD（原第 7863 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：JawsADD（原第 7888 行）
 function JawsADD() {
     var comp = app.project.activeItem;
     var frameRate = comp.frameRate;  // 获取合成的帧率
@@ -20109,7 +22266,7 @@ function JawsADD() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：huakuaikey（原第 7928 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：huakuaikey（原第 7953 行）
 function huakuaikey() {
     var comp = app.project.activeItem;
     if (comp && comp.selectedLayers.length > 0) {
@@ -20148,7 +22305,7 @@ function huakuaikey() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：JAWSrunC（原第 7969 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：JAWSrunC（原第 7994 行）
 function JAWSrunC() {
         app.beginUndoGroup("Add Black Bars");
     JawsAdd();
@@ -20156,7 +22313,7 @@ function JAWSrunC() {
     app.endUndoGroup();
     }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：JawsAdd（原第 7976 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：JawsAdd（原第 8001 行）
 function JawsAdd() {
     var comp = app.project.activeItem;
     var frameRate = comp.frameRate;  // 获取合成的帧率
@@ -20216,7 +22373,7 @@ function JawsAdd() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：huakuaiKEY（原第 8035 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：huakuaiKEY（原第 8060 行）
 function huakuaiKEY() {
 var comp = app.project.activeItem;
 if (comp && comp.selectedLayers.length > 0) {
@@ -20254,21 +22411,21 @@ if (comp && comp.selectedLayers.length > 0) {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：KEY_A（原第 8156 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：KEY_A（原第 8181 行）
 function KEY_A() {
     process("record");
     alignKeysKeepVelocity();
     process("apply");
     }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：KEY_B（原第 8162 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：KEY_B（原第 8187 行）
 function KEY_B() {
     process("record");
     alignKeysGlobalScale();
     process("apply");
     }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：alignKeysKeepVelocity（原第 8168 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：alignKeysKeepVelocity（原第 8193 行）
 function alignKeysKeepVelocity() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -20340,7 +22497,7 @@ function alignKeysKeepVelocity() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：alignKeysGlobalScale（原第 8239 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：alignKeysGlobalScale（原第 8264 行）
 function alignKeysGlobalScale() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -20436,12 +22593,12 @@ function alignKeysGlobalScale() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getFile（原第 8337 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getFile（原第 8362 行）
 function getFile() {
     return new File(__ecDesktop().fsName + "/" + FILE_NAME);
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：saveJSON（原第 8341 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：saveJSON（原第 8366 行）
 function saveJSON(data) {
     var f = getFile();
     f.open("w");
@@ -20449,7 +22606,7 @@ function saveJSON(data) {
     f.close();
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：loadJSON（原第 8348 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：loadJSON（原第 8373 行）
 function loadJSON() {
     var f = getFile();
     if (!f.exists) return null;
@@ -20459,7 +22616,7 @@ function loadJSON() {
     return JSON.parse(str);
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：deleteJSON（原第 8357 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：deleteJSON（原第 8382 行）
 function deleteJSON() {
     var f = getFile();
     if (f.exists) {
@@ -20467,12 +22624,12 @@ function deleteJSON() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getDim（原第 8365 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getDim（原第 8390 行）
 function getDim(prop) {
     return (prop.value instanceof Array) ? prop.value.length : 1;
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getAllKeyProps（原第 8370 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getAllKeyProps（原第 8395 行）
 function getAllKeyProps(group, result) {
     for (var i = 1; i <= group.numProperties; i++) {
         var p = group.property(i);
@@ -20487,7 +22644,7 @@ function getAllKeyProps(group, result) {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：recordEase（原第 8385 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：recordEase（原第 8410 行）
 function recordEase(prop) {
 
     var data = {
@@ -20538,7 +22695,7 @@ function recordEase(prop) {
     return data;
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：applyEase（原第 8436 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：applyEase（原第 8461 行）
 function applyEase(prop, data) {
     if (!data || !data.keys) return;
     if (prop.numKeys !== data.keys.length) return;
@@ -20586,7 +22743,7 @@ function applyEase(prop, data) {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：process（原第 8484 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：process（原第 8509 行）
 function process(mode) {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -20628,7 +22785,7 @@ function process(mode) {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：splitBetweenMarkers（原第 8530 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：splitBetweenMarkers（原第 8555 行）
 function splitBetweenMarkers() {
     app.beginUndoGroup("Split Layers Between Nearest Markers");
 
@@ -20738,7 +22895,7 @@ function splitBetweenMarkers() {
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：motionBlur（原第 8684 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：motionBlur（原第 8709 行）
 function motionBlur(){
 var comp = app.project.activeItem;
 if (comp instanceof CompItem) {
@@ -20747,7 +22904,7 @@ if (comp instanceof CompItem) {
 }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：WHLparentNullOBJ（原第 8693 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：WHLparentNullOBJ（原第 8718 行）
 function WHLparentNullOBJ() {
     if (!(app.project.activeItem && app.project.activeItem instanceof CompItem)) {
         alert("请先选择图层。");
@@ -20995,7 +23152,7 @@ function WHLparentNullOBJ() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：parentNullOBJ（原第 8942 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：parentNullOBJ（原第 8967 行）
 function parentNullOBJ() { // 批量
     if (!(app.project.activeItem && app.project.activeItem instanceof CompItem)) {
         alert("请先选择图层。");
@@ -21245,7 +23402,7 @@ if (
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedSolid（原第 9833 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedSolid（原第 9858 行）
 function AddParentedSolid(){
 var proj=app.project;
 if(!proj)return;
@@ -21309,7 +23466,7 @@ myLayers[s].selected=false;
 newSolid.selected=true;
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedSolid2（原第 9896 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedSolid2（原第 9921 行）
 function AddParentedSolid2(){//批量纯色层
 var proj=app.project;
 if(!proj)return;
@@ -21391,7 +23548,7 @@ createdSolids[i].selected=true;
 }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getCompFrameRate（原第 10106 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getCompFrameRate（原第 10131 行）
 function getCompFrameRate() {
     var comp = app.project.activeItem;
     if (comp instanceof CompItem) {
@@ -21402,7 +23559,7 @@ function getCompFrameRate() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：createOneSolidLayer_Frame（原第 10116 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：createOneSolidLayer_Frame（原第 10141 行）
 function createOneSolidLayer_Frame(){
 
 var comp=app.project.activeItem;
@@ -21482,7 +23639,7 @@ solid1.selected=true;
 
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：CameraOBJ（原第 10318 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：CameraOBJ（原第 10343 行）
 function CameraOBJ() {
     var comp = app.project.activeItem;
 
@@ -21675,7 +23832,7 @@ nullPos.setValue([
     cameraLayer.selected = false;
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：SetBelowLayerAnchorZero（原第 10513 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：SetBelowLayerAnchorZero（原第 10538 行）
 function SetBelowLayerAnchorZero() {
     var comp = app.project.activeItem;
 
@@ -21727,7 +23884,7 @@ function SetBelowLayerAnchorZero() {
     currentLayer.selected = true;
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：camera（原第 10655 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：camera（原第 10680 行）
 function camera() {
 var comp = app.project.activeItem;
 if (comp && comp instanceof CompItem) {
@@ -21947,7 +24104,7 @@ grid.locked = false;
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：SetViewToActiveCamera（原第 10874 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：SetViewToActiveCamera（原第 10899 行）
 function SetViewToActiveCamera(){
 var id = app.findMenuCommandId("Active Camera");
 if(id == 0){
@@ -21958,7 +24115,7 @@ app.executeCommand(id);
 }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedAdj（原第 10906 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedAdj（原第 10931 行）
 function AddParentedAdj(){//调整图层
 var proj=app.project;
 if(!proj)return;
@@ -22019,7 +24176,7 @@ myLayers[s].selected=false;
 newAdj.selected=true;
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedAdj2（原第 10966 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedAdj2（原第 10991 行）
 function AddParentedAdj2(){//批量调整图层
 var proj=app.project;
 if(!proj)return;
@@ -22083,7 +24240,7 @@ createdAdjs[i].selected=true;
 }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：createOneFrameAdjustmentLayer（原第 11122 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：createOneFrameAdjustmentLayer（原第 11147 行）
 function createOneFrameAdjustmentLayer() {
     // 获取当前合成
     var comp = app.project.activeItem;
@@ -22119,7 +24276,7 @@ function createOneFrameAdjustmentLayer() {
     comp.time += frameDuration;
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedText（原第 11169 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedText（原第 11194 行）
 function AddParentedText(){
 var proj=app.project;
 if(!proj)return;
@@ -22168,7 +24325,7 @@ app.executeCommand(10312);
 app.executeCommand(3819);
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedText2（原第 11217 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：AddParentedText2（原第 11242 行）
 function AddParentedText2(){//批量文本层
 var proj=app.project;
 if(!proj)return;
@@ -22210,7 +24367,7 @@ app.executeCommand(10312);
 app.executeCommand(3819);
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：runTimeB（原第 11424 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：runTimeB（原第 11449 行）
 function runTimeB() {
      var comp = app.project.activeItem;
 
@@ -22325,7 +24482,7 @@ function runTimeB() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：xingzhuang（原第 11646 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：xingzhuang（原第 11671 行）
 function xingzhuang() {
     var selectedShape = shapeDropdown.selection.index;  // 获取选择的形状类型
     var fillOption = false, strokeOption = false;
@@ -22490,7 +24647,7 @@ switch (selectedShape) {
   //  app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：createOneShapeLayer_Frame（原第 11810 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：createOneShapeLayer_Frame（原第 11835 行）
 function createOneShapeLayer_Frame(){
 
 var comp=app.project.activeItem;
@@ -22583,7 +24740,7 @@ shapeLayer.selected=true;
 
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：createTwoShapeLayer_Frame（原第 11902 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：createTwoShapeLayer_Frame（原第 11927 行）
 function createTwoShapeLayer_Frame(){
 
 var comp=app.project.activeItem;
@@ -22711,7 +24868,7 @@ shape2.selected=false;
 
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：markA（原第 12040 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：markA（原第 12065 行）
 function markA() {
     var comp = app.project.activeItem;
     if (comp == null || !(comp instanceof CompItem)) {
@@ -22734,7 +24891,7 @@ function markA() {
     markerAdded = true; // 标记已添加
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：markB（原第 12064 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：markB（原第 12089 行）
 function markB() {
     var comp = app.project.activeItem;
     if (comp && comp instanceof CompItem) {
@@ -22770,7 +24927,7 @@ function markB() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：maskcolorunA（原第 12110 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：maskcolorunA（原第 12135 行）
 function maskcolorunA() {
     app.beginUndoGroup("设置蒙版颜色为红色");
 var comp = app.project.activeItem;
@@ -22790,7 +24947,7 @@ if (comp && comp instanceof CompItem) {
 app.endUndoGroup();
     }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：maskcolorunB（原第 12129 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：maskcolorunB（原第 12154 行）
 function maskcolorunB() {
     app.beginUndoGroup("设置蒙版颜色为蓝色");
 var comp = app.project.activeItem;
@@ -22810,7 +24967,7 @@ if (comp && comp instanceof CompItem) {
 app.endUndoGroup();
     }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：maskcolorunC（原第 12148 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：maskcolorunC（原第 12173 行）
 function maskcolorunC() {
     app.beginUndoGroup("设置蒙版颜色为绿色");
 var comp = app.project.activeItem;
@@ -22830,7 +24987,7 @@ if (comp && comp instanceof CompItem) {
 app.endUndoGroup();
     }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：toggleMotionBlur（原第 12172 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：toggleMotionBlur（原第 12197 行）
 function toggleMotionBlur() {
     var comp = app.project.activeItem;
     if (comp && comp instanceof CompItem) {
@@ -22865,7 +25022,7 @@ function toggleMotionBlur() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：btnConvertA（原第 12208 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：btnConvertA（原第 12233 行）
 function btnConvertA() {
     var comp = app.project.activeItem;
     var theSelectedLayers = comp.selectedLayers;
@@ -22996,7 +25153,7 @@ function btnConvertA() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：btnConvertB（原第 12338 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：btnConvertB（原第 12363 行）
 function btnConvertB() {
     var comp = app.project.activeItem;
     if (!comp || !(comp instanceof CompItem) || comp.selectedLayers.length === 0) {
@@ -23025,7 +25182,7 @@ function btnConvertB() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：separateCharacters（原第 12367 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：separateCharacters（原第 12392 行）
 function separateCharacters(shapeLayer, textPosition, textAnchor, textScale) {
     var rootGroup = shapeLayer.property("ADBE Root Vectors Group");
     if (!rootGroup) {
@@ -23060,7 +25217,7 @@ function separateCharacters(shapeLayer, textPosition, textAnchor, textScale) {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：removeOtherShapes（原第 12402 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：removeOtherShapes（原第 12427 行）
 function removeOtherShapes(rootGroup, keepIndex) {
     for (var j = rootGroup.numProperties; j >= 1; j--) {
         if (j !== keepIndex) {
@@ -23069,7 +25226,7 @@ function removeOtherShapes(rootGroup, keepIndex) {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：adjustAnchorAndPosition（原第 12411 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：adjustAnchorAndPosition（原第 12436 行）
 function adjustAnchorAndPosition(layer, textPosition, textAnchor, textScale) {
     var rect = layer.sourceRectAtTime(0, false);
     var anchorX = rect.left + rect.width / 2;
@@ -23086,7 +25243,7 @@ function adjustAnchorAndPosition(layer, textPosition, textAnchor, textScale) {
     layer.transform.position.setValue([textPosition[0] + offsetX, textPosition[1] + offsetY]);
     }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：splitTextAndDuplicateShapeOrderedB（原第 12428 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：splitTextAndDuplicateShapeOrderedB（原第 12453 行）
 function splitTextAndDuplicateShapeOrderedB() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -23129,7 +25286,7 @@ keepShapesMatchingLayerName();
 app.executeCommand(10312);//居中
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：splitTextAndDuplicateShapeOrdered（原第 12470 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：splitTextAndDuplicateShapeOrdered（原第 12495 行）
 function splitTextAndDuplicateShapeOrdered() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -23173,7 +25330,7 @@ function splitTextAndDuplicateShapeOrdered() {
     createTextFromLayerName_matchTransform();
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：splitTextAndDuplicateShapeOrdered_row（原第 12514 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：splitTextAndDuplicateShapeOrdered_row（原第 12539 行）
 function splitTextAndDuplicateShapeOrdered_row() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -23228,7 +25385,7 @@ function splitTextAndDuplicateShapeOrdered_row() {
     createTextFromLayerName_matchTransform();
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：splitTextAndDuplicateShapeOrdered_row2（原第 12568 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：splitTextAndDuplicateShapeOrdered_row2（原第 12593 行）
 function splitTextAndDuplicateShapeOrdered_row2() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -23271,7 +25428,7 @@ function splitTextAndDuplicateShapeOrdered_row2() {
     app.executeCommand(10312); // 居中
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：keepShapesMatchingLayerName（原第 12611 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：keepShapesMatchingLayerName（原第 12636 行）
 function keepShapesMatchingLayerName() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) {
@@ -23307,7 +25464,7 @@ function keepShapesMatchingLayerName() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：keepShapesMatchingLayerName2（原第 12647 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：keepShapesMatchingLayerName2（原第 12672 行）
 function keepShapesMatchingLayerName2() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) {
@@ -23348,7 +25505,7 @@ function keepShapesMatchingLayerName2() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：createTextFromLayerName_matchTransform（原第 12688 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：createTextFromLayerName_matchTransform（原第 12713 行）
 function createTextFromLayerName_matchTransform() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -23398,7 +25555,7 @@ function createTextFromLayerName_matchTransform() {
     }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：Disassembly（原第 12738 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：Disassembly（原第 12763 行）
 function Disassembly() {
                 try {
                 var selayloop = 0;
@@ -23635,7 +25792,7 @@ function Disassembly() {
             }
         }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：enter（原第 12983 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：enter（原第 13008 行）
 function enter() {
 // 获取当前合成
 var comp = app.project.activeItem;
@@ -23856,7 +26013,7 @@ function SinglePrecomp() {
  app.endUndoGroup();
  }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：OutPrecomp（原第 13203 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：OutPrecomp（原第 13228 行）
 function OutPrecomp() {
 var comp = app.project.activeItem;
 if (!(comp && comp instanceof CompItem)) {
@@ -23927,7 +26084,7 @@ bar.close();
 app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getParentComp（原第 13273 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：getParentComp（原第 13298 行）
 function getParentComp() {
 var comp = app.project.activeItem;
 if (comp && comp.usedIn && comp.usedIn.length > 0) {
@@ -23939,7 +26096,7 @@ $.writeln("此合成没有上一级（父合成）");
 }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：Selected_Precomp（原第 13284 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：Selected_Precomp（原第 13309 行）
 function Selected_Precomp() {
 var comp = app.project.activeItem;
 if (comp && comp instanceof CompItem) {
@@ -23965,7 +26122,7 @@ targetLayer.selected = true;
 }
 }
 
-// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：Open_Precomposition（原第 13309 行）
+// [lazy-tabs] 从 tab2 提到 DockableUI 作用域：Open_Precomposition（原第 13334 行）
 function Open_Precomposition() {
 var comp = app.project.activeItem;
 if (comp instanceof CompItem && comp.selectedLayers.length > 0) {
@@ -23982,7 +26139,7 @@ $.writeln("请先选中一个图层。");
 }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：Targetarea（原第 13386 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：Targetarea（原第 13411 行）
 function Targetarea(){
 app.beginUndoGroup("CropROI");
 try{
@@ -24026,29 +26183,29 @@ reparentAll(savedChildren,precompLayer);
 finally{app.endUndoGroup();}
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getChildrenOf（原第 13429 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getChildrenOf（原第 13454 行）
 function getChildrenOf(l){var c=l.containingComp,childrenFound=[];for(var i=1;i<=c.numLayers;i++){var curLayer=c.layer(i);if(curLayer.parent===l){childrenFound.push(curLayer);}}return childrenFound;}
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：unparentAll（原第 13430 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：unparentAll（原第 13455 行）
 function unparentAll(a){for(var i=0;i<a.length;i++){var curLayer=a[i],isLocked=false;if(curLayer.locked){isLocked=true;curLayer.locked=false;}curLayer.parent=null;if(isLocked){curLayer.locked=true;}}}
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：reparentAll（原第 13431 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：reparentAll（原第 13456 行）
 function reparentAll(a,l){for(var i=0;i<a.length;i++){var curLayer=a[i],isLocked=false;if(curLayer.locked){isLocked=true;curLayer.locked=false;}curLayer.parent=l;if(isLocked){curLayer.locked=true;}}}
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：propHasKeys（原第 13433 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：propHasKeys（原第 13458 行）
 function propHasKeys(prp){
 if(!prp.dimensionsSeparated&&prp.numKeys){return true;}
 if(prp.dimensionsSeparated){for(var i=0;i<2;i++){if(prp.getSeparationFollower(i).numKeys>0){return true;}}}
 return false;
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：setValueOfProp（原第 13439 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：setValueOfProp（原第 13464 行）
 function setValueOfProp(prp,val){
 if(prp.dimensionsSeparated){for(var i=0;i<2;i++){prp.getSeparationFollower(i).setValue(val[i]);}}
 else{prp.setValue(val);}
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：offsetKeyValues（原第 13444 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：offsetKeyValues（原第 13469 行）
 function offsetKeyValues(prop,layer,comp,valToAdd){
 try{
 if(prop.dimensionsSeparated){
@@ -24064,7 +26221,7 @@ prop.setValueAtKey(i,prop.valueAtTime(prop.keyTime(i),true)+valToAdd);
 catch(err){alert(err.toString());}
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getAnchorWorld（原第 13459 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getAnchorWorld（原第 13484 行）
 function getAnchorWorld(l,comp){
 var temp3D=l.property("ADBE Effect Parade").addProperty("ADBE Point3D Control");
 var point3D=temp3D.property(1);
@@ -24074,14 +26231,14 @@ temp3D.remove();
 return ret;
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getPos1（原第 13468 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getPos1（原第 13493 行）
 function getPos1(c){
 var tempNull=c.layers.addNull();
 tempNull.name="CropROI_Temp_Null";
 return tempNull.property("ADBE Transform Group").property("ADBE Position").valueAtTime(0,false);
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getPos2（原第 13474 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getPos2（原第 13499 行）
 function getPos2(c){
 var tempNull=c.layer("CropROI_Temp_Null");
 var tempPos2=tempNull.property("ADBE Transform Group").property("ADBE Position").valueAtTime(0,false);
@@ -24089,10 +26246,10 @@ tempNull.remove();
 return tempPos2;
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：unfocus（原第 13481 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：unfocus（原第 13506 行）
 function unfocus(that){that.window.active=false;}
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：Croprun（原第 13493 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：Croprun（原第 13518 行）
 function Croprun(index) {
     try {
 
@@ -24180,7 +26337,7 @@ function Croprun(index) {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：adjustCompDuration（原第 13715 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：adjustCompDuration（原第 13740 行）
 function adjustCompDuration(increase) {
     var comp = app.project.activeItem; // 获取当前活动的合成
     if (comp && comp instanceof CompItem) {
@@ -24193,7 +26350,7 @@ function adjustCompDuration(increase) {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：promptForCustomName（原第 13767 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：promptForCustomName（原第 13792 行）
 function promptForCustomName(defaultName) {
 
     var dlg = new Window("dialog", "预合成名称");
@@ -24265,7 +26422,7 @@ function promptForCustomName(defaultName) {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getUniqueCompNameByBaseName（原第 13853 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getUniqueCompNameByBaseName（原第 13878 行）
 function getUniqueCompNameByBaseName(baseName) {
 
     var name = baseName;
@@ -24298,13 +26455,13 @@ function getUniqueCompNameByBaseName(baseName) {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getUniqueCompName（原第 13894 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getUniqueCompName（原第 13919 行）
 function getUniqueCompName() {
 
     return getUniqueCompNameByBaseName("预合成");
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：promptForCustomName（原第 14072 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：promptForCustomName（原第 14097 行）
 function promptForCustomName(defaultName) {
 
     var dlg = new Window(
@@ -24393,7 +26550,7 @@ function promptForCustomName(defaultName) {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：compNameExists（原第 14165 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：compNameExists（原第 14190 行）
 function compNameExists(name) {
 
     for (
@@ -24418,7 +26575,7 @@ function compNameExists(name) {
     return false;
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getUniquePrecompNameByBaseName（原第 14202 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getUniquePrecompNameByBaseName（原第 14227 行）
 function getUniquePrecompNameByBaseName(baseName) {
 
     var index = 1;
@@ -24452,7 +26609,7 @@ function getUniquePrecompNameByBaseName(baseName) {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getUniquePrecompName（原第 14246 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getUniquePrecompName（原第 14271 行）
 function getUniquePrecompName() {
 
     var index = 1;
@@ -24475,7 +26632,7 @@ function getUniquePrecompName() {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getBatchPrecompName（原第 14283 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getBatchPrecompName（原第 14308 行）
 function getBatchPrecompName() {
 
     if (
@@ -24494,7 +26651,7 @@ function getBatchPrecompName() {
     return getUniquePrecompName();
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：findPrecompLayer（原第 14306 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：findPrecompLayer（原第 14331 行）
 function findPrecompLayer(comp, precomp) {
 
     for (
@@ -24516,7 +26673,7 @@ function findPrecompLayer(comp, precomp) {
     return null;
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：setLayerTime（原第 14332 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：setLayerTime（原第 14357 行）
 function setLayerTime(
     layer,
     inPoint,
@@ -24534,7 +26691,7 @@ function setLayerTime(
     layer.outPoint = outPoint;
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：MultiPrecomp（原第 14363 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：MultiPrecomp（原第 14388 行）
 function MultiPrecomp() {
 
     var comp =
@@ -24802,7 +26959,7 @@ function MultiPrecomp() {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：MultiParentPrecomp（原第 14642 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：MultiParentPrecomp（原第 14667 行）
 function MultiParentPrecomp() {
 
     var comp =
@@ -25174,7 +27331,7 @@ function MultiParentPrecomp() {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：Link（原第 15015 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：Link（原第 15040 行）
 function Link() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -25236,7 +27393,7 @@ function Link() {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：Precompose（原第 15077 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：Precompose（原第 15102 行）
 function Precompose() {
 
     var comp = app.project.activeItem;
@@ -25725,7 +27882,7 @@ function Precompose() {
     customPrecomposeName = null;
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：Link_Precompose（原第 15567 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：Link_Precompose（原第 15592 行）
 function Link_Precompose() {
 
     var comp = app.project.activeItem;
@@ -26056,7 +28213,7 @@ function Link_Precompose() {
     customPrecomposeName = null;
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：RestoreLayerEndTime（原第 15898 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：RestoreLayerEndTime（原第 15923 行）
 function RestoreLayerEndTime() {
 
     var comp = app.project.activeItem;
@@ -26128,7 +28285,7 @@ function RestoreLayerEndTime() {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：openPrecompAndSelectAll（原第 16116 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：openPrecompAndSelectAll（原第 16141 行）
 function openPrecompAndSelectAll() {
     app.beginUndoGroup("解预合成");
     Resume_composition();
@@ -26194,7 +28351,7 @@ function openPrecompAndSelectAll() {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：adjustLayersToOriginalInPoint（原第 16182 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：adjustLayersToOriginalInPoint（原第 16207 行）
 function adjustLayersToOriginalInPoint(layers, originalInPoint) {
     if (layers.length < 1) return;
     // 获取最底层图层的入点（即最后一个图层的入点）
@@ -26207,7 +28364,7 @@ function adjustLayersToOriginalInPoint(layers, originalInPoint) {
   }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：selectLayerSource（原第 16196 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：selectLayerSource（原第 16221 行）
 function selectLayerSource() {
     var comp = app.project.activeItem;
     if (!comp || !(comp instanceof CompItem)) {
@@ -26230,7 +28387,7 @@ function selectLayerSource() {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：shanchu（原第 16219 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：shanchu（原第 16244 行）
 function shanchu() {
     if (app.project.selection.length > 0) {
         for (var i = app.project.selection.length - 1; i >= 0; i--) {
@@ -26239,7 +28396,7 @@ function shanchu() {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：deleteItemRecursively（原第 16228 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：deleteItemRecursively（原第 16253 行）
 function deleteItemRecursively(item) {
     if (item instanceof FolderItem) {
         for (var i = item.numItems; i >= 1; i--) {
@@ -26249,7 +28406,7 @@ function deleteItemRecursively(item) {
     item.remove();
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：organizeProjectAll（原第 16380 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：organizeProjectAll（原第 16405 行）
 function organizeProjectAll() {
     var proj = app.project;
     if (!proj) return;
@@ -26547,7 +28704,7 @@ function organizeProjectAll() {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：MoveProjectAndAssets（原第 16725 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：MoveProjectAndAssets（原第 16750 行）
 function MoveProjectAndAssets(){
     var proj = app.project;
     if(!proj){
@@ -26727,7 +28884,7 @@ if(!destFolder.exists)
     );
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：isImageSequence（原第 16904 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：isImageSequence（原第 16929 行）
 function isImageSequence(file) {
     var name = file.name;
     var match = name.match(/^(.*?)(\d+)(\.\w+)$/);
@@ -26749,7 +28906,7 @@ function isImageSequence(file) {
     return false;
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：copyFolder（原第 16926 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：copyFolder（原第 16951 行）
 function copyFolder(srcFolder, dstFolder) {
     if (!dstFolder.exists) dstFolder.create();
     var files = srcFolder.getFiles();
@@ -26763,7 +28920,7 @@ function copyFolder(srcFolder, dstFolder) {
     }
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getFirstSequenceFrame（原第 16939 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getFirstSequenceFrame（原第 16964 行）
 function getFirstSequenceFrame(file){
     var folder=file.parent;
     var name=file.name;
@@ -26798,7 +28955,7 @@ function getFirstSequenceFrame(file){
     return frames[0];
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getAssetCategory（原第 16975 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：getAssetCategory（原第 17000 行）
 function getAssetCategory(file){
     var ext = file.name
         .toLowerCase()
@@ -26853,7 +29010,7 @@ function getAssetCategory(file){
     return "其他";
 }
 
-// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：qx（原第 17074 行）
+// [lazy-tabs] 从 tab3 提到 DockableUI 作用域：qx（原第 17099 行）
 function qx(){
     var comp = app.project.activeItem;
 
@@ -26884,7 +29041,7 @@ function qx(){
     }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：SHAKE（原第 17254 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：SHAKE（原第 17279 行）
 function SHAKE() {
 
     var comp = app.project.activeItem;
@@ -27035,7 +29192,7 @@ applyRotationSway(layer.transform.rotation, rotMin, rotMax, rotStep, rotCount);
     }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：Z_axis（原第 17406 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：Z_axis（原第 17431 行）
 function Z_axis(){
 
     var comp = app.project.activeItem;
@@ -27119,7 +29276,7 @@ function Z_axis(){
     }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：sublayer（原第 17557 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：sublayer（原第 17582 行）
 function sublayer() {
 var comp = app.project.activeItem;
 if (!(comp instanceof CompItem)) {
@@ -27163,7 +29320,7 @@ bottomLayers[m].selected = true;
 }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：payynuz_shake（原第 17689 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：payynuz_shake（原第 17714 行）
 function payynuz_shake(){
         var item = app.project.activeItem;
         var clip = item.selectedLayers;
@@ -27370,24 +29527,24 @@ function payynuz_shake(){
         }
     }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：rng（原第 17895 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：rng（原第 17920 行）
 function rng(x, y) {
         var num = Math.floor(generateRandomNumber() * ((y - x) + 1)) + x;
         return num;
     }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：a（原第 17901 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：a（原第 17926 行）
 function a() {
         alert(c);
         c++;
     }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：randomInt（原第 17944 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：randomInt（原第 17969 行）
 function randomInt(min, max){
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：buildRotationKeys（原第 17948 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：buildRotationKeys（原第 17973 行）
 function buildRotationKeys(baseValue) {
 
     if (isNaN(baseValue)) return;
@@ -27453,7 +29610,7 @@ function buildRotationKeys(baseValue) {
     app.endUndoGroup();
     }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：moveXKeys（原第 18044 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：moveXKeys（原第 18069 行）
 function moveXKeys(direction){
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) return;
@@ -27489,7 +29646,7 @@ function moveXKeys(direction){
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：moveYKeys（原第 18078 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：moveYKeys（原第 18103 行）
 function moveYKeys(direction){
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) return;
@@ -27525,15 +29682,15 @@ function moveYKeys(direction){
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：randomInt（原第 18115 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：randomInt（原第 18140 行）
 function randomInt(min,max){return Math.floor(Math.random()*(max-min+1))+min;}
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：randomInt（原第 18193 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：randomInt（原第 18218 行）
 function randomInt(min, max){
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：createRotationKeys（原第 18197 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：createRotationKeys（原第 18222 行）
 function createRotationKeys() {
 
     var comp = app.project.activeItem;
@@ -27616,7 +29773,7 @@ for (var i = 0; i <= positionProp.numKeys; i++) {
     //app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：selectMaskPaths（原第 18348 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：selectMaskPaths（原第 18373 行）
 function selectMaskPaths() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -27682,7 +29839,7 @@ function selectMaskPaths() {
     }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：selectFirstAndLastPositionKeys（原第 18413 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：selectFirstAndLastPositionKeys（原第 18438 行）
 function selectFirstAndLastPositionKeys() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) {
@@ -27715,12 +29872,12 @@ function selectFirstAndLastPositionKeys() {
 app.executeCommand(2509);//缓动
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：randomInt（原第 18445 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：randomInt（原第 18470 行）
 function randomInt(min,max){
     return Math.floor(Math.random()*(max-min+1))+min;
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：Mask_shakeB（原第 18449 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：Mask_shakeB（原第 18474 行）
 function Mask_shakeB(){
 
     var comp=app.project.activeItem;
@@ -27878,7 +30035,7 @@ function Mask_shakeB(){
     //app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：size2（原第 18607 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：size2（原第 18632 行）
 function size2() {
     var comp = app.project.activeItem;
 
@@ -27918,7 +30075,7 @@ function size2() {
     }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：stretchPositionKeysToLayerInOut（原第 18646 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：stretchPositionKeysToLayerInOut（原第 18671 行）
 function stretchPositionKeysToLayerInOut() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -27997,7 +30154,7 @@ run();
  //   app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：getRoveCommandId（原第 18724 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：getRoveCommandId（原第 18749 行）
 function getRoveCommandId() {
     var id = app.findMenuCommandId("漂浮穿梭时间");
     if (!id || id === 0) {
@@ -28006,7 +30163,7 @@ function getRoveCommandId() {
     return id;
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：selectAllPositionKeys（原第 18731 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：selectAllPositionKeys（原第 18756 行）
 function selectAllPositionKeys(layer) {
     var pos = layer.transform.position;
     // 如果是分离维度
@@ -28031,7 +30188,7 @@ function selectAllPositionKeys(layer) {
     }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：run（原第 18754 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：run（原第 18779 行）
 function run() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) {
@@ -28056,7 +30213,7 @@ function run() {
     }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：refreshFFXDropdown（原第 18829 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：refreshFFXDropdown（原第 18854 行）
 function refreshFFXDropdown() {
     var lastText = ShakeffxDropdown.selection
         ? ShakeffxDropdown.selection.text
@@ -28095,7 +30252,7 @@ function refreshFFXDropdown() {
     ShakeffxDropdown.selection = restoreIndex;
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ShakeapplyA（原第 18893 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ShakeapplyA（原第 18918 行）
 function ShakeapplyA() {
     app.beginUndoGroup("应用Shake预设");
 
@@ -28129,7 +30286,7 @@ function ShakeapplyA() {
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ffxapplyBtnA（原第 18927 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ffxapplyBtnA（原第 18952 行）
 function ffxapplyBtnA() {
     var comp = app.project.activeItem;
     var selectedLayers = comp.selectedLayers;
@@ -28154,7 +30311,7 @@ function ffxapplyBtnA() {
     comp.time = originalTime;
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ShakeapplyB（原第 18954 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ShakeapplyB（原第 18979 行）
 function ShakeapplyB() {
     app.beginUndoGroup("应用Shake预设并添加标记");
 
@@ -28187,7 +30344,7 @@ function ShakeapplyB() {
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ffxapplyBtnB（原第 18987 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ffxapplyBtnB（原第 19012 行）
 function ffxapplyBtnB() {
     var comp = app.project.activeItem;
     var selectedLayers = comp.selectedLayers;
@@ -28217,7 +30374,7 @@ function ffxapplyBtnB() {
     comp.time = originalTime;
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ShakeFxxA（原第 19027 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ShakeFxxA（原第 19052 行）
 function ShakeFxxA(layer) {
                 var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -28246,7 +30403,7 @@ function ShakeFxxA(layer) {
     }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ShakeFxxB（原第 19062 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ShakeFxxB（原第 19087 行）
 function ShakeFxxB(layer) {
                 var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -28275,7 +30432,7 @@ function ShakeFxxB(layer) {
     }
         }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ShakeNull（原第 19090 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：ShakeNull（原第 19115 行）
 function ShakeNull(layer) {
     if (!(app.project.activeItem && app.project.activeItem instanceof CompItem)) {
         alert("请先选择一个合成。");
@@ -28374,7 +30531,7 @@ function ShakeNull(layer) {
     nullLayer.label = 1;
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：shuxingAndKeyframeFixedValues1（原第 19218 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：shuxingAndKeyframeFixedValues1（原第 19243 行）
 function shuxingAndKeyframeFixedValues1() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -28501,7 +30658,7 @@ for (var i = 0; i < layers.length; i++) {
 }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：deselectAllKeys（原第 19344 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：deselectAllKeys（原第 19369 行）
 function deselectAllKeys(prop) {
     if (!prop) return;
     for (var i = 1; i <= prop.numKeys; i++) {
@@ -28509,7 +30666,7 @@ function deselectAllKeys(prop) {
     }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：shuxingAndKeyframeFixedValues2（原第 19351 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：shuxingAndKeyframeFixedValues2（原第 19376 行）
 function shuxingAndKeyframeFixedValues2() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -28635,7 +30792,7 @@ for (var i = 0; i < layers.length; i++) {
 }
 }
 
-// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：CHONGZHI（原第 19479 行）
+// [lazy-tabs] 从 tab4 提到 DockableUI 作用域：CHONGZHI（原第 19504 行）
 function CHONGZHI() {
     var comp = app.project.activeItem;
     if (comp && comp instanceof CompItem && comp.selectedLayers.length > 0) {
@@ -28693,7 +30850,7 @@ function CHONGZHI() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Import_copy_images（原第 19662 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Import_copy_images（原第 19687 行）
 function Import_copy_images() {
     if ((!app.project) || (!app.project.activeItem) || (!(app.project.activeItem instanceof CompItem))) {
         alert("Please select a Composition Timeline first.", "Fast Paste");
@@ -28747,7 +30904,7 @@ function Import_copy_images() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：exportSelectedLayer（原第 19857 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：exportSelectedLayer（原第 19882 行）
 function exportSelectedLayer() {
 
     var comp = app.project.activeItem;
@@ -28879,7 +31036,7 @@ function exportSelectedLayer() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：screenshotOnly（原第 20054 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：screenshotOnly（原第 20079 行）
 function screenshotOnly() {
     if (!toolboxFolder) {
         alert("请先设置工具箱大师中转站路径");
@@ -29242,7 +31399,7 @@ function screenshotOnly() {
     return frameAsPng();
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：importSimilarImagesToTimeline（原第 20422 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：importSimilarImagesToTimeline（原第 20447 行）
 function importSimilarImagesToTimeline() {
 
     // ========================================================
@@ -29471,7 +31628,7 @@ function importSimilarImagesToTimeline() {
     return true;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：importDownloadedVideosToTimeline（原第 20655 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：importDownloadedVideosToTimeline（原第 20680 行）
 function importDownloadedVideosToTimeline() {
 
     // ========================================================
@@ -29730,7 +31887,7 @@ function importDownloadedVideosToTimeline() {
     return true;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：startSimilaritySearch（原第 20924 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：startSimilaritySearch（原第 20949 行）
 function startSimilaritySearch() {
 
     if (!toolboxFolder) {
@@ -29856,7 +32013,7 @@ function startSimilaritySearch() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：starttrace_moe（原第 21057 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：starttrace_moe（原第 21082 行）
 function starttrace_moe() {
 
     if (!toolboxFolder) {
@@ -29985,7 +32142,7 @@ function starttrace_moe() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：FIX（原第 21442 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：FIX（原第 21467 行）
 function FIX() {
     app.beginUndoGroup("移动资源并生成bat");
 
@@ -30122,7 +32279,7 @@ function FIX() {
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：waitForDownload（原第 21578 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：waitForDownload（原第 21603 行）
 function waitForDownload(folder){
     var videoExt = /\.(mp4|mov|mkv|avi|flv|webm|m4v|mp3|wav|m4a|aac|flac|ogg)$/i;
 
@@ -30147,7 +32304,7 @@ function waitForDownload(folder){
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Super_import（原第 21602 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Super_import（原第 21627 行）
 function Super_import() {
     if (!app.project.file) {
         alert("请先保存工程文件");
@@ -30251,7 +32408,7 @@ function Super_import() {
 deselectProjectItems();
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：offsetLayersToBelowLayer（原第 21732 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：offsetLayersToBelowLayer（原第 21757 行）
 function offsetLayersToBelowLayer() {
     var comp = app.project.activeItem;
     if (!comp || !(comp instanceof CompItem)) {
@@ -30307,7 +32464,7 @@ function offsetLayersToBelowLayer() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：one_Workspace（原第 21795 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：one_Workspace（原第 21820 行）
 function one_Workspace() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) return;
@@ -30328,7 +32485,7 @@ function one_Workspace() {
     comp.workAreaDuration = workAreaEnd - workAreaStart;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：shiftInPointToCompStart（原第 21815 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：shiftInPointToCompStart（原第 21840 行）
 function shiftInPointToCompStart() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) return;
@@ -30342,7 +32499,7 @@ function shiftInPointToCompStart() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：addTintToSelectedLayersSilently（原第 21832 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：addTintToSelectedLayersSilently（原第 21857 行）
 function addTintToSelectedLayersSilently() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -30374,12 +32531,12 @@ function addTintToSelectedLayersSilently() {
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：bgRemoveDiag（原第 22137 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：bgRemoveDiag（原第 22162 行）
 function bgRemoveDiag(step, message, isError) {
     return;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：bgRemoveWaitForFile（原第 22142 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：bgRemoveWaitForFile（原第 22167 行）
 function bgRemoveWaitForFile(file, maxLoops) {
     maxLoops = maxLoops || 200;
     var f = new File(file.fsName);
@@ -30393,14 +32550,14 @@ function bgRemoveWaitForFile(file, maxLoops) {
     return (f.exists && f.length > 0) ? f : null;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：bgRemoveSanitizeFileName（原第 22155 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：bgRemoveSanitizeFileName（原第 22180 行）
 function bgRemoveSanitizeFileName(name) {
     return String(name)
         .replace(/[\\\/:\*\?"<>\|]/g, "_")
         .replace(/^\s+|\s+$/g, "");
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：launchBackgroundRemoveExe（原第 22162 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：launchBackgroundRemoveExe（原第 22187 行）
 function launchBackgroundRemoveExe(useAdmin) {
 
     var step = useAdmin ? "启动抠图程序(视频)" : "启动抠图程序(图片)";
@@ -30523,7 +32680,7 @@ function launchBackgroundRemoveExe(useAdmin) {
     return false;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Imageradiobackground（原第 22383 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Imageradiobackground（原第 22408 行）
 function Imageradiobackground() {
     try {
         createRunFile();
@@ -30544,7 +32701,7 @@ function Imageradiobackground() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：videoradiobackground（原第 22403 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：videoradiobackground（原第 22428 行）
 function videoradiobackground() {
     try {
         createRunFile();
@@ -30562,7 +32719,7 @@ function videoradiobackground() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：createRunFile（原第 22421 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：createRunFile（原第 22446 行）
 function createRunFile() {
     try {
         if(!toolboxFolder){
@@ -30600,19 +32757,19 @@ function createRunFile() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：rendering（原第 22459 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：rendering（原第 22484 行）
 function rendering() {
     for (var r = app.project.renderQueue.numItems; r >= 1; r--) {
         app.project.renderQueue.item(r).remove();
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Save（原第 22465 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Save（原第 22490 行）
 function Save() {
    app.executeCommand(5);  //保存ID命令··
    }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：deleteAllImagesInFolder（原第 22469 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：deleteAllImagesInFolder（原第 22494 行）
 function deleteAllImagesInFolder() {
     try {
         if(!toolboxFolder){
@@ -30644,7 +32801,7 @@ function deleteAllImagesInFolder() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：PNG_background（原第 22500 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：PNG_background（原第 22525 行）
 function PNG_background() {
 if(!toolboxFolder){
         alert("请先设置工具箱大师中转站路径")
@@ -30720,7 +32877,7 @@ if(!toolboxFolder){
     return false;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：matchInOutWithBelowLayer（原第 22575 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：matchInOutWithBelowLayer（原第 22600 行）
 function matchInOutWithBelowLayer() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) {
@@ -30747,7 +32904,7 @@ function matchInOutWithBelowLayer() {
     layer.outPoint = outP;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：waitForRunningFileDisappear（原第 22602 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：waitForRunningFileDisappear（原第 22627 行）
 function waitForRunningFileDisappear() {
 
     if(!toolboxFolder){
@@ -30781,7 +32938,7 @@ function waitForRunningFileDisappear() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：MAIN（原第 22635 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：MAIN（原第 22660 行）
 function MAIN() {
     var comp = null;
     var selectedLayers = null;
@@ -30898,7 +33055,7 @@ function MAIN() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：cometime（原第 22751 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：cometime（原第 22776 行）
 function cometime() {
 // 获取当前合成
     var comp = app.project.activeItem;
@@ -30912,7 +33069,7 @@ function cometime() {
     } else {}
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：monitorAndRun（原第 22844 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：monitorAndRun（原第 22869 行）
 function monitorAndRun() {
     // 获取脚本所在目录
     if(!toolboxFolder){
@@ -30945,7 +33102,7 @@ function monitorAndRun() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：monitorAndRun2（原第 22878 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：monitorAndRun2（原第 22903 行）
 function monitorAndRun2() {
 
     // ========================================================
@@ -31066,7 +33223,7 @@ function monitorAndRun2() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Workspace（原第 23050 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Workspace（原第 23075 行）
 function Workspace() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) return;
@@ -31097,7 +33254,7 @@ function Workspace() {
     comp.workAreaDuration = workAreaEnd - workAreaStart;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：outputmp4（原第 23080 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：outputmp4（原第 23105 行）
 function outputmp4() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) {
@@ -31235,17 +33392,17 @@ function outputmp4() {
     return success;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：checkAndRunBackgroundRemove（原第 23218 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：checkAndRunBackgroundRemove（原第 23243 行）
 function checkAndRunBackgroundRemove() {
     return launchBackgroundRemoveExe(false);
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：runBackgroundRemove（原第 23222 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：runBackgroundRemove（原第 23247 行）
 function runBackgroundRemove() {
     return launchBackgroundRemoveExe(true);
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：RunpngBackgroundRemove（原第 23226 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：RunpngBackgroundRemove（原第 23251 行）
 function RunpngBackgroundRemove() {
     if(!toolboxFolder){
         alert("请先设置工具箱大师中转站路径")
@@ -31281,7 +33438,7 @@ function RunpngBackgroundRemove() {
     return true;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：deleteVideoOnly（原第 23284 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：deleteVideoOnly（原第 23309 行）
 function deleteVideoOnly() {
     try {
 
@@ -31313,7 +33470,7 @@ function deleteVideoOnly() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Black_Picture（原第 23315 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Black_Picture（原第 23340 行）
 function Black_Picture() {
     // 获取脚本所在路径
     if(!toolboxFolder){
@@ -31357,14 +33514,14 @@ function Black_Picture() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：isBlackImage（原第 23358 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：isBlackImage（原第 23383 行）
 function isBlackImage(file) {
     if (!file.exists) return false;
     // 小于阈值字节数认为是黑图（可调整）
     return file.length < 10000; // 小于1m视为黑图
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：copyImportAndAddMOVToTimeline（原第 23364 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：copyImportAndAddMOVToTimeline（原第 23389 行）
 function copyImportAndAddMOVToTimeline() {
     if (!toolboxFolder) {
         alert("请先设置工具箱大师中转站路径");
@@ -31555,7 +33712,7 @@ function copyImportAndAddMOVToTimeline() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：one_png（原第 23555 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：one_png（原第 23580 行）
 function one_png() {
 
     if(!toolboxFolder){
@@ -31692,7 +33849,7 @@ function one_png() {
     */
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：IN_OUT（原第 23691 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：IN_OUT（原第 23716 行）
 function IN_OUT() {
     var comp = app.project.activeItem;
     if (comp && comp instanceof CompItem) {
@@ -31724,7 +33881,7 @@ function IN_OUT() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Start4（原第 23736 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Start4（原第 23761 行）
 function Start4() {
 var comp = app.project.activeItem;
 if (!(comp instanceof CompItem)) {
@@ -31761,7 +33918,7 @@ data.layer.startTime = data.startTime;
 run_sceneCut();
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：run_Cut（原第 23772 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：run_Cut（原第 23797 行）
 function run_Cut() {
 if(!toolboxFolder){
         alert("请先设置工具箱大师中转站路径")
@@ -31792,7 +33949,7 @@ system.callSystem(cmd);
 return true;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：run_JSX（原第 23803 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：run_JSX（原第 23828 行）
 function run_JSX() {
 // 获取当前脚本所在文件夹
 if(!toolboxFolder){
@@ -31823,7 +33980,7 @@ alert("运行失败：" + file.name + "\n" + e.toString());
 }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：run_sceneCut（原第 23834 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：run_sceneCut（原第 23859 行）
 function run_sceneCut() {
 var comp = app.project.activeItem;
 if (comp && comp instanceof CompItem) {
@@ -31882,7 +34039,7 @@ duplicatedLayers[l].selected = false;
 }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：reverseSelectedLayersOrderVisible（原第 23892 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：reverseSelectedLayersOrderVisible（原第 23917 行）
 function reverseSelectedLayersOrderVisible() {
 var comp = app.project.activeItem;
 if (comp && comp instanceof CompItem) {
@@ -31922,7 +34079,7 @@ layersToProcess = remainingLayers;
 }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：fps（原第 23931 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：fps（原第 23956 行）
 function fps() {
 var comp = app.project.activeItem;
 if (!(comp instanceof CompItem)) return; // 没有合成则退出
@@ -31940,7 +34097,7 @@ layer.remove(); // 删除不足1帧的图层
 }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Delete_jsx（原第 23948 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Delete_jsx（原第 23973 行）
 function Delete_jsx() {
 if(!toolboxFolder){
         alert("请先设置工具箱大师中转站路径")
@@ -31966,7 +34123,7 @@ $.writeln("目标文件夹不存在：" + targetFolder.fsName);
 }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Export_mp4（原第 23974 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Export_mp4（原第 23999 行）
 function Export_mp4() {
         var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -31996,14 +34153,14 @@ function Export_mp4() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：shanchurendering（原第 24003 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：shanchurendering（原第 24028 行）
 function shanchurendering() {
     for (var r = app.project.renderQueue.numItems; r >= 1; r--) {
         app.project.renderQueue.item(r).remove();
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Start2（原第 24009 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Start2（原第 24034 行）
 function Start2() {
     var comp = app.project.activeItem;
     if (!comp || !(comp instanceof CompItem)) {
@@ -32051,7 +34208,7 @@ function Start2() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Start（原第 24057 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：Start（原第 24082 行）
 function Start() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -32093,7 +34250,7 @@ function Start() {
 }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：one_Workspace（原第 24098 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：one_Workspace（原第 24123 行）
 function one_Workspace() {
     var comp = app.project.activeItem;
 
@@ -32120,7 +34277,7 @@ function one_Workspace() {
     comp.workAreaDuration = workAreaEnd - workAreaStart;
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：AVI_TO_MP4（原第 24125 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：AVI_TO_MP4（原第 24150 行）
 function AVI_TO_MP4() {
        var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) {
@@ -32197,7 +34354,7 @@ function AVI_TO_MP4() {
     comp.openInViewer();
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：restoreWorkArea（原第 24266 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：restoreWorkArea（原第 24291 行）
 function restoreWorkArea() {
     var comp = app.project.activeItem;
     if (comp instanceof CompItem) {
@@ -32214,7 +34371,7 @@ function restoreWorkArea() {
     }
 }
 
-// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：moveAndImportMediaFiles（原第 24282 行）
+// [lazy-tabs] 从 tab5 提到 DockableUI 作用域：moveAndImportMediaFiles（原第 24307 行）
 function moveAndImportMediaFiles() {
     // 获取脚本所在目录
     if(!toolboxFolder){
@@ -32282,7 +34439,7 @@ function moveAndImportMediaFiles() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：drawNeonButton（原第 24435 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：drawNeonButton（原第 24460 行）
 function drawNeonButton(control, label, fontSize, offsetX, offsetY) {
 
     control.onDraw = function () {
@@ -32414,7 +34571,7 @@ function drawNeonButton(control, label, fontSize, offsetX, offsetY) {
     };
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：drawNeonLabel（原第 24571 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：drawNeonLabel（原第 24596 行）
 function drawNeonLabel(control, label, fontSize, yOffset) {
 
     control.onDraw = function () {
@@ -32442,7 +34599,7 @@ function drawNeonLabel(control, label, fontSize, yOffset) {
     };
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：setNeonPanel（原第 24603 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：setNeonPanel（原第 24628 行）
 function setNeonPanel(panel) {
 
     panel.graphics.backgroundColor =
@@ -32452,7 +34609,7 @@ function setNeonPanel(panel) {
         );
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Image_RIFE（原第 26051 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Image_RIFE（原第 26076 行）
 function Image_RIFE() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -32577,7 +34734,7 @@ function Image_RIFE() {
     app.scheduleTask("__deleteTempComp__()", 500, false);
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：run_Image_RIFE（原第 26176 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：run_Image_RIFE（原第 26201 行）
 function run_Image_RIFE() {
 
     var comp = app.project.activeItem;
@@ -33195,7 +35352,7 @@ function run_Image_RIFE() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：getLatestOutputFolder（原第 26795 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：getLatestOutputFolder（原第 26820 行）
 function getLatestOutputFolder(path) {
     var base = new Folder(path);
     if (!base.exists) {
@@ -33232,7 +35389,7 @@ function getLatestOutputFolder(path) {
     return latest;
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：mp4_frame_fill2（原第 26831 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：mp4_frame_fill2（原第 26856 行）
 function mp4_frame_fill2() {
 
     var comp = app.project.activeItem;
@@ -33487,7 +35644,7 @@ function mp4_frame_fill2() {
     comp.openInViewer();
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Rename_video（原第 27162 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Rename_video（原第 27187 行）
 function Rename_video() {
 
     // ========================= 基础检查 =========================
@@ -33838,7 +35995,7 @@ function Rename_video() {
     deselectProjectItems();
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：checkComp（原第 27532 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：checkComp（原第 27557 行）
 function checkComp() {
         if (app.project.activeItem == null || !(app.project.activeItem instanceof CompItem)) {
             alert("No comp selected");
@@ -33852,13 +36009,13 @@ function checkComp() {
         return true;
     }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：rng（原第 27545 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：rng（原第 27570 行）
 function rng(x, y) {
         var num = Math.floor(generateRandomNumber() * ((y - x) + 1)) + x;
         return num;
     }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Delete_KEY2（原第 27550 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Delete_KEY2（原第 27575 行）
 function Delete_KEY2() {
     if (!checkComp()) {
         return false;
@@ -33887,7 +36044,7 @@ MergeKey();
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：MergeKey（原第 27578 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：MergeKey（原第 27603 行）
 function MergeKey() {
     var comp = app.project.activeItem;
     if (comp && comp instanceof CompItem) {
@@ -33931,7 +36088,7 @@ function MergeKey() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Resume_composition（原第 27793 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Resume_composition（原第 27818 行）
 function Resume_composition() {
    // app.beginUndoGroup("预合成匹配当前合成并保持画面");
     try {
@@ -34155,7 +36312,7 @@ function Resume_composition() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：deleteItemRecursively（原第 28017 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：deleteItemRecursively（原第 28042 行）
 function deleteItemRecursively(item) {
     if (item instanceof FolderItem) {
         for (var i = item.numItems; i >= 1; i--) {
@@ -34165,7 +36322,7 @@ function deleteItemRecursively(item) {
     item.remove();
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：mp4_frame_realcugan（原第 28796 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：mp4_frame_realcugan（原第 28821 行）
 function mp4_frame_realcugan() {
 
     // ============================================================
@@ -34620,7 +36777,7 @@ function mp4_frame_realcugan() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：SOLO（原第 29550 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：SOLO（原第 29575 行）
 function SOLO(){  
 var comp = app.project.activeItem;
 if (comp && comp.selectedLayers.length > 0) {
@@ -34631,7 +36788,7 @@ if (comp && comp.selectedLayers.length > 0) {
 }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：moveImageSequenceFolders（原第 29561 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：moveImageSequenceFolders（原第 29586 行）
 function moveImageSequenceFolders(sourceFolder) {
 
     // =============================================================
@@ -35122,7 +37279,7 @@ function moveImageSequenceFolders(sourceFolder) {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：deleteFolder（原第 30053 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：deleteFolder（原第 30078 行）
 function deleteFolder(folder) {
     var files = folder.getFiles();
     for (var i = 0; i < files.length; i++) {
@@ -35136,7 +37293,7 @@ function deleteFolder(folder) {
     folder.remove();
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：duiqi（原第 30066 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：duiqi（原第 30091 行）
 function duiqi() {
 
     var comp = app.project.activeItem;
@@ -35187,12 +37344,12 @@ function duiqi() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：BaoCun（原第 30116 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：BaoCun（原第 30141 行）
 function BaoCun() {
    app.executeCommand(5);  //保存ID命令··
    }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：shiftInPointToCompStart（原第 30120 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：shiftInPointToCompStart（原第 30145 行）
 function shiftInPointToCompStart() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) return;
@@ -35206,7 +37363,7 @@ function shiftInPointToCompStart() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：KUANGAO（原第 30168 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：KUANGAO（原第 30193 行）
 function  KUANGAO() {
     var comp = app.project.activeItem;
 
@@ -35233,7 +37390,7 @@ function  KUANGAO() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：WenJianJia（原第 30194 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：WenJianJia（原第 30219 行）
 function  WenJianJia() {
     var folderName = "工具箱大师提升画质";
     var targetFolder = null;
@@ -35267,7 +37424,7 @@ function  WenJianJia() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：TimerunA（原第 30399 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：TimerunA（原第 30424 行）
 function TimerunA() {
     var comp = app.project.activeItem;
     if (comp == null) {
@@ -35307,7 +37464,7 @@ function TimerunA() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：OUT2（原第 30508 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：OUT2（原第 30533 行）
 function OUT2() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -35331,7 +37488,7 @@ function OUT2() {
     timeRemap.setValueAtTime(newSecondKeyTime, secondValue);
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Keybtn（原第 30606 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Keybtn（原第 30631 行）
 function Keybtn() {
     function scanKeys(prop, result) {
         if (!prop) return;
@@ -35392,7 +37549,7 @@ function Keybtn() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Export_RIFE（原第 30680 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Export_RIFE（原第 30705 行）
 function Export_RIFE() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -35514,7 +37671,7 @@ function Export_RIFE() {
     app.scheduleTask("__deleteTempComp__()", 500, false);
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：runRIFEA（原第 30801 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：runRIFEA（原第 30826 行）
 function runRIFEA() {
     deselectProjectItems2();
     app.executeCommand(5);
@@ -35524,7 +37681,7 @@ function runRIFEA() {
     duiqi();
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Start6（原第 30810 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Start6（原第 30835 行）
 function Start6() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -35564,7 +37721,7 @@ function Start6() {
 }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：syncWorkAreaToComp（原第 30849 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：syncWorkAreaToComp（原第 30874 行）
 function syncWorkAreaToComp() {
     try {
         if (!(app.project && app.project.activeItem && (app.project.activeItem instanceof CompItem))) {
@@ -35582,7 +37739,7 @@ function syncWorkAreaToComp() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：mp4_frame_fill（原第 30866 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：mp4_frame_fill（原第 30891 行）
 function mp4_frame_fill() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) {
@@ -35711,7 +37868,7 @@ function mp4_frame_fill() {
     comp.openInViewer();
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：deselectProjectItems2（原第 30996 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：deselectProjectItems2（原第 31021 行）
 function deselectProjectItems2() {
     var proj = app.project;
     if (!proj) return;
@@ -35722,7 +37879,7 @@ function deselectProjectItems2() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：deleteVideosInFolder（原第 31009 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：deleteVideosInFolder（原第 31034 行）
 function deleteVideosInFolder() {
 
     // ============================================================
@@ -36062,14 +38219,14 @@ function deleteVideosInFolder() {
     return true;
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Delete_the_render（原第 31348 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Delete_the_render（原第 31373 行）
 function Delete_the_render() {//删除渲染
     for (var r = app.project.renderQueue.numItems; r >= 1; r--) {
         app.project.renderQueue.item(r).remove();
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Start3（原第 31354 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Start3（原第 31379 行）
 function Start3() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -36113,7 +38270,7 @@ function Start3() {
 moveAndImportMP4Files();
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Workspace2（原第 31397 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Workspace2（原第 31422 行）
 function Workspace2() {
     var comp = app.project.activeItem;
 
@@ -36140,7 +38297,7 @@ function Workspace2() {
     comp.workAreaDuration = workAreaEnd - workAreaStart;
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：mp4_2（原第 31423 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：mp4_2（原第 31448 行）
 function mp4_2() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) {
@@ -36218,7 +38375,7 @@ function mp4_2() {
     comp.openInViewer();
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：recover（原第 31500 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：recover（原第 31525 行）
 function recover() {
     var comp = app.project.activeItem;
     if (comp instanceof CompItem) {
@@ -36235,7 +38392,7 @@ function recover() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：run_Frame_Extraction（原第 31516 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：run_Frame_Extraction（原第 31541 行）
 function run_Frame_Extraction() {
     if(!toolboxFolder){
         alert(
@@ -36274,7 +38431,7 @@ function run_Frame_Extraction() {
     return true;
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：moveAndImportMP4Files（原第 31554 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：moveAndImportMP4Files（原第 31579 行）
 function moveAndImportMP4Files() {
     // 获取脚本所在目录
     if(!toolboxFolder){
@@ -36330,7 +38487,7 @@ function moveAndImportMP4Files() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：RIFE（原第 31609 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：RIFE（原第 31634 行）
 function RIFE() {
 
     // ============================================================
@@ -37344,7 +39501,7 @@ function RIFE() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：moveAndImportMP4Files2（原第 32622 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：moveAndImportMP4Files2（原第 32647 行）
 function moveAndImportMP4Files2() {
 
     // ============================================================
@@ -37727,13 +39884,13 @@ function moveAndImportMP4Files2() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：deleteFolder（原第 33005 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：deleteFolder（原第 33030 行）
 function deleteFolder(folder) {
     if (!folder.exists) return;
     system.callSystem('cmd.exe /c rmdir /S /Q "' + folder.fsName + '"');
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：PrecomposeWithCurrentFrameRate（原第 33011 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：PrecomposeWithCurrentFrameRate（原第 33036 行）
 function PrecomposeWithCurrentFrameRate() {
     function check() {
         if (app.project.activeItem == null || !(app.project.activeItem instanceof CompItem)) {
@@ -37782,7 +39939,7 @@ function PrecomposeWithCurrentFrameRate() {
     }
 }
 
-// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Delete_empty_folders（原第 33060 行）
+// [lazy-tabs] 从 tab6 提到 DockableUI 作用域：Delete_empty_folders（原第 33085 行）
 function Delete_empty_folders() {
     if (!app.project.file) {
         alert("请先保存当前工程！");
@@ -37847,7 +40004,7 @@ function Delete_empty_folders() {
     }
 }
 
-// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：All_attributes（原第 33704 行）
+// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：All_attributes（原第 33729 行）
 function All_attributes(){
     app.beginUndoGroup("Reset Layers & Clear Error Expressions");
     removeTextAnimators();
@@ -37952,7 +40109,7 @@ function All_attributes(){
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：selectLayerStyles（原第 33807 行）
+// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：selectLayerStyles（原第 33832 行）
 function selectLayerStyles() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -37964,7 +40121,7 @@ function selectLayerStyles() {
     }
 }
 
-// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：removeTextAnimators（原第 33817 行）
+// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：removeTextAnimators（原第 33842 行）
 function removeTextAnimators() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -37991,7 +40148,7 @@ function removeTextAnimators() {
     }
 }
 
-// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：resetTransformProperties（原第 33858 行）
+// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：resetTransformProperties（原第 33883 行）
 function resetTransformProperties() {
         if (app.project.activeItem && app.project.activeItem instanceof CompItem) {
             var comp = app.project.activeItem;
@@ -38051,7 +40208,7 @@ function resetTransformProperties() {
         }
     }
 
-// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：resetTransformPropertiesAtPlayhead（原第 33917 行）
+// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：resetTransformPropertiesAtPlayhead（原第 33942 行）
 function resetTransformPropertiesAtPlayhead() {
         if (app.project.activeItem && app.project.activeItem instanceof CompItem) {
             var comp = app.project.activeItem;
@@ -38102,7 +40259,7 @@ function resetTransformPropertiesAtPlayhead() {
         }
     }
 
-// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：removeAllEffects（原第 33967 行）
+// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：removeAllEffects（原第 33992 行）
 function removeAllEffects() {     
         if (app.project.activeItem && app.project.activeItem instanceof CompItem) {
             var comp = app.project.activeItem;
@@ -38124,7 +40281,7 @@ function removeAllEffects() {
         }
     }
 
-// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：removeAllMasks（原第 33988 行）
+// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：removeAllMasks（原第 34013 行）
 function removeAllMasks() {
         if (app.project.activeItem && app.project.activeItem instanceof CompItem) {
             var comp = app.project.activeItem;
@@ -38146,7 +40303,7 @@ function removeAllMasks() {
         }
     }
 
-// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：size（原第 34010 行）
+// [lazy-tabs] 从 tab8 提到 DockableUI 作用域：size（原第 34035 行）
 function size() {
 var comp = app.project.activeItem;
 if (comp && comp instanceof CompItem && comp.selectedLayers.length > 0) {
@@ -38173,7 +40330,7 @@ if (comp && comp instanceof CompItem && comp.selectedLayers.length > 0) {
 }
 }
 
-// [lazy-tabs] 从 tab9 提到 DockableUI 作用域：loadPresetsFromFolder（原第 34103 行）
+// [lazy-tabs] 从 tab9 提到 DockableUI 作用域：loadPresetsFromFolder（原第 34128 行）
 function loadPresetsFromFolder(folder){
     if(!folder) return;
 
@@ -38193,7 +40350,7 @@ function loadPresetsFromFolder(folder){
 
 }
 
-// [lazy-tabs] 从 tab9 提到 DockableUI 作用域：applyAnimationPreset（原第 34195 行）
+// [lazy-tabs] 从 tab9 提到 DockableUI 作用域：applyAnimationPreset（原第 34220 行）
 function applyAnimationPreset(){
 
     var comp = app.project.activeItem;
@@ -38231,7 +40388,7 @@ function applyAnimationPreset(){
 
 }
 
-// [lazy-tabs] 从 tab10 提到 DockableUI 作用域：importWavToComp（原第 34327 行）
+// [lazy-tabs] 从 tab10 提到 DockableUI 作用域：importWavToComp（原第 34352 行）
 function importWavToComp(filename) {
     var file = new File(sfxFolder.fsName + "/" + filename);
     if (!file.exists) return;
@@ -38276,7 +40433,7 @@ deselectProjectItems();
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab10 提到 DockableUI 作用域：previewWavByName（原第 34373 行）
+// [lazy-tabs] 从 tab10 提到 DockableUI 作用域：previewWavByName（原第 34398 行）
 function previewWavByName(filename) {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) {
@@ -38314,7 +40471,7 @@ function previewWavByName(filename) {
     );
 }
 
-// [lazy-tabs] 从 tab10 提到 DockableUI 作用域：getFilteredFiles（原第 34412 行）
+// [lazy-tabs] 从 tab10 提到 DockableUI 作用域：getFilteredFiles（原第 34437 行）
 function getFilteredFiles(keyword) {
     var result = [];
     var lowerKeyword = keyword.toLowerCase();
@@ -38327,7 +40484,7 @@ function getFilteredFiles(keyword) {
     return result;
 }
 
-// [lazy-tabs] 从 tab10 提到 DockableUI 作用域：refreshPage（原第 34425 行）
+// [lazy-tabs] 从 tab10 提到 DockableUI 作用域：refreshPage（原第 34450 行）
 function refreshPage() {
     if (buttonsGroup) {
         contentGroup.remove(buttonsGroup);
@@ -38366,7 +40523,7 @@ function refreshPage() {
     tab10.layout.layout(true);
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Rain（原第 34590 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Rain（原第 34615 行）
 function Rain() {
 
     var comp = app.project.activeItem;
@@ -38438,7 +40595,7 @@ function Rain() {
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Color_level（原第 34662 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Color_level（原第 34687 行）
 function Color_level() {
     var comp = app.project.activeItem;
     if (!(comp && comp.selectedLayers.length > 0)) return;
@@ -38463,7 +40620,7 @@ function Color_level() {
     }
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Matte_And_Glass（原第 34686 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Matte_And_Glass（原第 34711 行）
 function Matte_And_Glass() {
     var comp = app.project.activeItem;
     if (!(comp && comp.selectedLayers.length > 0)) return;
@@ -38522,7 +40679,7 @@ function Matte_And_Glass() {
     }
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Halftone（原第 34744 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Halftone（原第 34769 行）
 function Halftone() {
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) return;
@@ -38565,7 +40722,7 @@ function Halftone() {
     }
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Mask_reversal（原第 34785 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Mask_reversal（原第 34810 行）
 function Mask_reversal() {
     var comp = app.project.activeItem;
     if (!(comp && comp instanceof CompItem)) return;
@@ -38587,7 +40744,7 @@ function Mask_reversal() {
     }
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：particles（原第 34844 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：particles（原第 34869 行）
 function particles(){
     app.beginUndoGroup("应用内嵌 FFX 预设");
     AddParentedSolid();
@@ -38624,7 +40781,7 @@ function particles(){
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Plexus（原第 34880 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Plexus（原第 34905 行）
 function Plexus(){
             app.beginUndoGroup("添加效果");
         AddParentedSolid();
@@ -38697,7 +40854,7 @@ function Plexus(){
     }
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Flickering（原第 34952 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Flickering（原第 34977 行）
 function Flickering(){
     app.beginUndoGroup("应用内嵌 FFX 预设");
     TEXT();
@@ -38737,7 +40894,7 @@ function Flickering(){
     app.endUndoGroup();
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：TEXT（原第 34991 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：TEXT（原第 35016 行）
 function TEXT() {
     if (app.project.activeItem && app.project.activeItem instanceof CompItem) {
         var comp = app.project.activeItem;
@@ -38791,7 +40948,7 @@ function TEXT() {
     }
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：importTemplateAndPlace（原第 35044 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：importTemplateAndPlace（原第 35069 行）
 function importTemplateAndPlace() {
 
 // ============================================================
@@ -39167,7 +41324,7 @@ newLayer.selected = true;
 
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Indicator_LineFFX（原第 35421 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Indicator_LineFFX（原第 35446 行）
 function Indicator_LineFFX(){
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -39207,7 +41364,7 @@ tmpFile.close();
  //   tmpFile.remove();
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：replaceIndicatorCompName（原第 35462 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：replaceIndicatorCompName（原第 35487 行）
 function replaceIndicatorCompName() {
 
     try {
@@ -39356,7 +41513,7 @@ function replaceIndicatorCompName() {
     }
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：replaceInPropertyGroup（原第 35615 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：replaceInPropertyGroup（原第 35640 行）
 function replaceInPropertyGroup(
     group,
     mainCompName,
@@ -39500,7 +41657,7 @@ function replaceInPropertyGroup(
     }
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：escapeExpressionString（原第 35763 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：escapeExpressionString（原第 35788 行）
 function escapeExpressionString(name) {
 
     return String(name)
@@ -39508,7 +41665,7 @@ function escapeExpressionString(name) {
         .replace(/"/g, '\\"');
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：importnikovax（原第 35770 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：importnikovax（原第 35795 行）
 function importnikovax() {
 // ============================================================
 // 基础检查
@@ -39889,7 +42046,7 @@ if (newLayer) {
 
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：nikovaxFFX（原第 36151 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：nikovaxFFX（原第 36176 行）
 function nikovaxFFX(){
     var comp = app.project.activeItem;
     if (!(comp instanceof CompItem)) {
@@ -39929,7 +42086,7 @@ tmpFile.close();
  //   tmpFile.remove();
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：rope（原第 36190 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：rope（原第 36215 行）
 function rope() {
     app.beginUndoGroup("应用内嵌FFX + 绳索");
     var comp = app.project.activeItem;
@@ -40069,7 +42226,7 @@ function Turbulent_Shadow() {
 }
 }
 
-// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Backlight（原第 36329 行）
+// [lazy-tabs] 从 tab11 提到 DockableUI 作用域：Backlight（原第 36354 行）
 function Backlight() {
     if (app.project.activeItem && app.project.activeItem.selectedLayers.length > 0) {
         app.beginUndoGroup("添加效果");
@@ -40108,7 +42265,7 @@ function Backlight() {
     }
 }
 
-// [lazy-tabs] 从 tab12 提到 DockableUI 作用域：deleteAllImagesInFolder2（原第 36433 行）
+// [lazy-tabs] 从 tab12 提到 DockableUI 作用域：deleteAllImagesInFolder2（原第 36458 行）
 function deleteAllImagesInFolder2() {
     try {
         if(!toolboxFolder){
@@ -40140,7 +42297,7 @@ function deleteAllImagesInFolder2() {
     }
 }
 
-// [lazy-tabs] 从 tab12 提到 DockableUI 作用域：PNG_background2（原第 36464 行）
+// [lazy-tabs] 从 tab12 提到 DockableUI 作用域：PNG_background2（原第 36489 行）
 function PNG_background2() {
     if (!toolboxFolder) {
         alert("请先设置工具箱大师中转站路径");
@@ -40228,7 +42385,7 @@ function PNG_background2() {
     return false;
 }
 
-// [lazy-tabs] 从 tab12 提到 DockableUI 作用域：launchGPTEditExe（原第 36551 行）
+// [lazy-tabs] 从 tab12 提到 DockableUI 作用域：launchGPTEditExe（原第 36576 行）
 function launchGPTEditExe(useAdmin) {
 
     if (!toolboxFolder) {
@@ -40348,7 +42505,7 @@ function launchGPTEditExe(useAdmin) {
     return false;
 }
 
-// [lazy-tabs] 从 tab12 提到 DockableUI 作用域：importGPTOutputToAE（原第 36676 行）
+// [lazy-tabs] 从 tab12 提到 DockableUI 作用域：importGPTOutputToAE（原第 36701 行）
 function importGPTOutputToAE() {
 
     // ==============================
@@ -40694,20 +42851,22 @@ function syncWorkAreaToComp() {
             tabs[index] = __ecTabBuilders[index]();
             // 懒构建出来的控件没赶上面板创建时的布局抛光，这里补一轮（EffectCraft 专用）
             try { __ecPolishLayout(win); } catch (ecPolishErr) {}
+            // 懒构建的 tab 也要按当前语言翻译
+            try { __ecApplyLang(tabs[index]); } catch (ecLangErr) {}
         }
         for (var i = 0; i < tabs.length; i++) {
             if (!tabs[i]) { continue; }
             tabs[i].visible = (i === index);
         }
+        // 切进来的 tab 再翻一次（启动时 tab1 可能在 __ecApplyLang(win) 之后才建好）
+        try { if (tabs[index]) __ecApplyLang(tabs[index]); } catch (ecLangErrShown) {}
     }
 
     // 初始化
-    nav.onChange = function () {
-        if (nav.selection) {
-            showTab(__ecTabOrder[nav.selection.index]);
-        }
-    };
-    nav.selection = 0;
+    __ecNav.select(0);
+    showTab(0);
+    // tab1 由 showTab 懒建；必须等它建完再翻译，否则启动时 tab1 仍是中文
+    try { __ecApplyLang(win); } catch (ecLangErr2) {}
     showTab(0);
 
     // 调整布局
@@ -40732,6 +42891,7 @@ function showWindow(myWindow) {
 // 主入口
 var win = DockableUI(this);
     try { __ecPolishLayout(win); __ecDensifyLayout(win); } catch (ecPolishErr) {}
+    try { $.global.__ecMainWin = win; __ecApplyLang(win); } catch (ecLangErr) {}
 showWindow(win);
 try {
     toolboxCheckUpdateOnStartup();
