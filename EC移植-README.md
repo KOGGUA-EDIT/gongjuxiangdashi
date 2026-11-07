@@ -3,7 +3,19 @@
 基于原版 `工具箱大师.jsx` v1.0.123（AE ScriptUI 面板）移植到 **EffectCraft / ArtCraft**（0.21.x）的版本。
 不是一个重写，而是**同一份脚本 + 兼容层 + 若干裁剪**，所以界面、按钮图、交互习惯尽量与原版一致。
 
-当前版本：**0.1.15**（原版 v1.0.123 派生）
+当前版本：**0.1.23**
+![面板预览](https://raw.githubusercontent.com/KOGGUA-EDIT/gongjuxiangdashi/ec-port/docs/panel.png)
+
+## 最近更新（v0.1.23）
+
+- 左侧「脚本」展开栏：常用脚本添加/命名、右键重命名/删除/打开文件夹、点击悬浮窗运行；设置里可改脚本目录
+- 中英双语：设置勾选 English 立即切换（1126 条文案），重启记住选择
+- 设置窗统一整理：左对齐、行距、半长暗灰分隔线、目录行留白（中英文一致）
+- 布局/性能：切语言重新计算控件尺寸、缩窄单字母复选框、去掉「预合成」灰标题、移除悬停重绘
+- 细节修复：设置窗「确定」可正常关闭、脚本栏底部无缝、折叠三角改等边
+
+完整更新记录见 [CHANGELOG.md](https://github.com/KOGGUA-EDIT/gongjuxiangdashi/blob/ec-port/CHANGELOG.md)。
+（原版 v1.0.123 派生）
 
 ## 安装
 
