@@ -19,7 +19,7 @@
 
 ## 安装
 
-1. 把 `工具箱大师-EC移植.jsx` 复制到：
+1. 下载 release 里的 `ToolboxMaster-EC-v0.1.23.jsx`（可重命名为 `工具箱大师-EC移植.jsx`），复制到：
    ```
    %APPDATA%\EffectCraft\Scripts\ScriptUI Panels\
    ```
